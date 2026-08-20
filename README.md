@@ -1,7 +1,7 @@
 # Renderizador
 Renderizador base para o curso de Computação Gráfica
 
-Desenvolvido por: Marcelo Alonso e Lucas Abatepietro
+Desenvolvido por: Marcelo Vergamini Terni Alonso e Lucas Bertachini Abatepietro
 
 Pré-requisitos:
 
