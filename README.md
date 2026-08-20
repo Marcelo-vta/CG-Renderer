@@ -1,6 +1,8 @@
 # Renderizador
 Renderizador base para o curso de Computação Gráfica
 
+Desenvolvido por: Marcelo Alonso e Lucas Abatepietro
+
 Pré-requisitos:
 
 ```sh
