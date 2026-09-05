@@ -24,9 +24,93 @@ class GL:
     near = 0.01   # plano de corte próximo
     far = 1000    # plano de corte distante
 
-    viewpoint_val = np.array()
-    transform_in_val = np.array()
-    transform_out_val = np.array()
+    # viewpoint_val   : matriz Projeção @ LookAt  (mundo -> NDC)
+    # transform_in_val: matriz de modelo corrente (objeto -> mundo)
+    # transform_out_val: matriz restaurada ao sair de um nó Transform
+    viewpoint_val = np.identity(4)
+    transform_in_val = np.identity(4)
+    transform_out_val = np.identity(4)
+
+    # Pilha para hierarquia de Transforms (Transform dentro de Transform)
+    transform_stack = []
+
+    # ------------------------------------------------------------------
+    # Matrizes auxiliares (todas 4x4 em coordenadas homogêneas)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def translation_matrix(translation):
+        """Matriz de translação 4x4 a partir de [tx, ty, tz]."""
+        T = np.identity(4)
+        if translation:
+            T[0, 3], T[1, 3], T[2, 3] = translation[0], translation[1], translation[2]
+        return T
+
+    @staticmethod
+    def scale_matrix(scale):
+        """Matriz de escala 4x4 a partir de [sx, sy, sz]."""
+        S = np.identity(4)
+        if scale:
+            S[0, 0], S[1, 1], S[2, 2] = scale[0], scale[1], scale[2]
+        return S
+
+    @staticmethod
+    def rotation_matrix(rotation):
+        """Matriz de rotação 4x4 via quatérnio, a partir de [x, y, z, theta]."""
+        if not rotation:
+            return np.identity(4)
+
+        axis = np.array(rotation[:3], dtype=float)
+        theta = rotation[3]
+
+        norm = np.linalg.norm(axis)
+        if norm == 0 or theta == 0:
+            return np.identity(4)
+        axis = axis / norm
+
+        # quatérnio unitário: parte vetorial = eixo*sin(theta/2), escalar = cos(theta/2)
+        qi, qj, qk = axis * math.sin(theta / 2.0)
+        qr = math.cos(theta / 2.0)
+
+        return np.array([
+            [1 - 2*(qj*qj + qk*qk), 2*(qi*qj - qk*qr),     2*(qi*qk + qj*qr),     0],
+            [2*(qi*qj + qk*qr),     1 - 2*(qi*qi + qk*qk), 2*(qj*qk - qi*qr),     0],
+            [2*(qi*qk - qj*qr),     2*(qj*qk + qi*qr),     1 - 2*(qi*qi + qj*qj), 0],
+            [0,                     0,                     0,                     1]
+        ])
+
+    @staticmethod
+    def perspective_matrix(fieldOfView):
+        """Matriz de projeção perspectiva (espaço da câmera -> NDC)."""
+        aspect = GL.width / GL.height
+
+        # X3D define fieldOfView como o menor ângulo de visão; converte para fovy
+        fovy = 2 * math.atan(
+            math.tan(fieldOfView / 2.0) * GL.height / math.sqrt(GL.height**2 + GL.width**2)
+        )
+
+        top = GL.near * math.tan(fovy / 2.0)
+        right = top * aspect
+
+        near, far = GL.near, GL.far
+
+        return np.array([
+            [near/right, 0,        0,                        0],
+            [0,          near/top, 0,                        0],
+            [0,          0,        -(far + near)/(far-near), (-2*far*near)/(far-near)],
+            [0,          0,        -1,                       0]
+        ])
+
+    @staticmethod
+    def screen_matrix():
+        """Matriz de tela: NDC -> coordenadas de pixel (espelha Y, translada e escala)."""
+        W, H = GL.width, GL.height
+        return np.array([
+            [W/2,  0,    0, W/2],
+            [0,   -H/2,  0, H/2],
+            [0,    0,    1, 0],
+            [0,    0,    0, 1]
+        ])
 
     @staticmethod
     def setup(width, height, near=0.01, far=1000):
@@ -234,11 +318,15 @@ class GL:
             xs = [p[0] for p in vertices]
             ys = [p[1] for p in vertices]
 
-            x_min = round(min(xs))
-            x_max = round(max(xs))
+            # Limita a caixa envolvente à tela: sem isso um triângulo muito grande
+            # (ou muito próximo da câmera) faz o loop varrer milhões de pixels fora
+            # do framebuffer. O draw() já descarta esses pixels, então o resultado
+            # é idêntico — só que sem travar.
+            x_min = max(round(min(xs)), 0)
+            x_max = min(round(max(xs)), fb_dim[1] - 1)
 
-            y_min = round(min(ys))
-            y_max = round(max(ys))
+            y_min = max(round(min(ys)), 0)
+            y_max = min(round(max(ys)), fb_dim[0] - 1)
 
 
             for y in range(y_min, y_max+1):
@@ -269,15 +357,35 @@ class GL:
         # (emissiveColor), conforme implementar novos materias você deverá suportar outros
         # tipos de cores.
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("TriangleSet : pontos = {0}".format(point)) # imprime no terminal pontos
-        print("TriangleSet : colors = {0}".format(colors)) # imprime no terminal as cores
+        if not point:
+            return
 
-        points = list(zip((point[::3]), point[1::3], point[2::3]))
-        triangles = list(zip((points[::3]), points[1::3], points[2::3]))
+        # 1) Pontos do objeto em coordenadas homogêneas -> matriz 4 x N
+        pts = np.array(point, dtype=float).reshape(-1, 3).T      # 3 x N
+        pts_h = np.vstack([pts, np.ones(pts.shape[1])])          # 4 x N
 
-        # Exemplo de desenho de um pixel branco na coordenada 10, 10
-        gpu.GPU.draw_pixel([10, 10], gpu.GPU.RGB8, [255, 255, 255])  # altera pixel
+        # 2) Pipeline completo: Screen @ (Projeção @ LookAt) @ Modelo
+        #    objeto -> mundo -> câmera -> NDC -> tela
+        M = GL.screen_matrix() @ GL.viewpoint_val @ GL.transform_in_val
+
+        proj = M @ pts_h                                         # 4 x N
+
+        # 3) Divisão homogênea (perspective divide).
+        #    w == -z_camera: se w <= 0 o vértice está atrás (ou em cima) do plano da
+        #    câmera e a divisão explode. Sem clipping de near plane, o mais seguro é
+        #    descartar o triângulo inteiro.
+        w = proj[3].copy()
+        seguro = w > 1e-9
+        proj = np.divide(proj, w, out=np.zeros_like(proj), where=seguro)
+
+        # 4) Rasteriza triângulo a triângulo, reaproveitando o triangleSet2D
+        for i in range(0, proj.shape[1] - 2, 3):
+            if not seguro[i:i+3].all():
+                continue
+            tri = proj[:2, i:i+3].T.flatten().tolist()
+            if not all(math.isfinite(c) for c in tri):
+                continue
+            GL.triangleSet2D(tri, colors)
 
     @staticmethod
     def viewpoint(position, orientation, fieldOfView):
@@ -286,15 +394,23 @@ class GL:
         # câmera virtual. Use esses dados para poder calcular e criar a matriz de projeção
         # perspectiva para poder aplicar nos pontos dos objetos geométricos.
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("Viewpoint : ", end='')
-        print("position = {0} ".format(position), end='')
-        print("orientation = {0} ".format(orientation), end='')
-        print("fieldOfView = {0} ".format(fieldOfView))
+        # A câmera no mundo é: C = T(position) @ R(orientation)
+        # A matriz de "look at" (mundo -> câmera) é a inversa disso:
+        #   C^-1 = R^-1 @ T^-1 = R^T @ T(-position)
+        R = GL.rotation_matrix(orientation)
+        T = GL.translation_matrix(position)
 
-        # Calcular matriz e salvar na variavel da classe
+        R_inv = R.T                                  # rotação é ortonormal
+        T_inv = np.identity(4)
+        T_inv[:3, 3] = -T[:3, 3]
 
-        
+        look_at = R_inv @ T_inv
+
+        # Projeção perspectiva (câmera -> NDC)
+        P = GL.perspective_matrix(fieldOfView)
+
+        # Guarda o conjunto câmera + projeção (mundo -> NDC)
+        GL.viewpoint_val = P @ look_at
 
     @staticmethod
     def transform_in(translation, scale, rotation):
@@ -310,17 +426,19 @@ class GL:
         # Quando começar a usar Transforms dentre de outros Transforms, mais a frente no curso
         # Você precisará usar alguma estrutura de dados pilha para organizar as matrizes.
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("Transform : ", end='')
-        if translation:
-            print("translation = {0} ".format(translation), end='') # imprime no terminal
-        if scale:
-            print("scale = {0} ".format(scale), end='') # imprime no terminal
-        if rotation:
-            print("rotation = {0} ".format(rotation), end='') # imprime no terminal
-        print("")
-        
-        # Calcular matriz e salvar na variavel da classe
+        # Guarda a matriz atual na pilha para poder restaurar no transform_out
+        GL.transform_stack.append(GL.transform_in_val)
+
+        T = GL.translation_matrix(translation)
+        R = GL.rotation_matrix(rotation)
+        S = GL.scale_matrix(scale)
+
+        # Ordem de aplicação no X3D: escala, depois rotação, depois translação.
+        # Como a multiplicação age da direita para a esquerda: M = T @ R @ S
+        M = T @ R @ S
+
+        # Acumula com a matriz do pai (permite Transforms aninhados)
+        GL.transform_in_val = GL.transform_in_val @ M
 
     @staticmethod
     def transform_out():
@@ -330,8 +448,13 @@ class GL:
         # deverá recuperar a matriz de transformação dos modelos do mundo da estrutura de
         # pilha implementada.
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("Saindo de Transform")
+        if GL.transform_stack:
+            GL.transform_out_val = GL.transform_stack.pop()
+        else:
+            GL.transform_out_val = np.identity(4)
+
+        # A matriz corrente volta a ser a do nó pai
+        GL.transform_in_val = GL.transform_out_val
 
     @staticmethod
     def triangleStripSet(point, stripCount, colors):
