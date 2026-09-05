@@ -24,6 +24,10 @@ class GL:
     near = 0.01   # plano de corte próximo
     far = 1000    # plano de corte distante
 
+    viewpoint_val = np.array()
+    transform_in_val = np.array()
+    transform_out_val = np.array()
+
     @staticmethod
     def setup(width, height, near=0.01, far=1000):
         """Definr parametros para câmera de razão de aspecto, plano próximo e distante."""
@@ -213,9 +217,9 @@ class GL:
             
         
         points = list(zip((vertices[::2]), vertices[1::2]))
-        emissive_color = [int(i*255) for i in colors["emissiveColor"]]
-
         triangles = list(zip((points[::3]), points[1::3], points[2::3]))
+
+        emissive_color = [int(i*255) for i in colors["emissiveColor"]]
 
         def triangleSingle2D(vertices, color):
 
@@ -248,11 +252,6 @@ class GL:
 
             
 
-            
-
-
-
-
     @staticmethod
     def triangleSet(point, colors):
         """Função usada para renderizar TriangleSet."""
@@ -274,6 +273,9 @@ class GL:
         print("TriangleSet : pontos = {0}".format(point)) # imprime no terminal pontos
         print("TriangleSet : colors = {0}".format(colors)) # imprime no terminal as cores
 
+        points = list(zip((point[::3]), point[1::3], point[2::3]))
+        triangles = list(zip((points[::3]), points[1::3], points[2::3]))
+
         # Exemplo de desenho de um pixel branco na coordenada 10, 10
         gpu.GPU.draw_pixel([10, 10], gpu.GPU.RGB8, [255, 255, 255])  # altera pixel
 
@@ -289,6 +291,10 @@ class GL:
         print("position = {0} ".format(position), end='')
         print("orientation = {0} ".format(orientation), end='')
         print("fieldOfView = {0} ".format(fieldOfView))
+
+        # Calcular matriz e salvar na variavel da classe
+
+        
 
     @staticmethod
     def transform_in(translation, scale, rotation):
@@ -313,6 +319,8 @@ class GL:
         if rotation:
             print("rotation = {0} ".format(rotation), end='') # imprime no terminal
         print("")
+        
+        # Calcular matriz e salvar na variavel da classe
 
     @staticmethod
     def transform_out():
