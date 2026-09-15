@@ -24,8 +24,8 @@ class GL:
     near = 0.01   # plano de corte próximo
     far = 1000    # plano de corte distante
 
-    viewpoint_val = np.eye(4)
-    transform_stack = [np.eye(4)]
+    viewpoint_val = np.eye(4) # Matriz de viewpoint
+    transform_stack = [np.eye(4)] # Pilha de matrizes de transformação
 
     @staticmethod
     def draw(coord, color):
@@ -209,21 +209,25 @@ class GL:
         def triangleSingle2D(vertices, color):
 
             def semiplane(a, b, p):
+                # Retorna a normal da reta a-b em relação ao ponto p
                 return (p[0]-a[0])*(b[1]-a[1]) - (p[1]-a[1])*(b[0]-a[0])
 
             def inside(p0, p1, p2, pixel):
+                # Retorna True se o pixel estiver dentro do triangulo abc,
+                # caso contrário retorna False
+
+                # As normais entre as retas p0-p1 p1-p2 p2-p0
                 a, b, c = semiplane(p0, p1, pixel), semiplane(p1, p2, pixel), semiplane(p2, p0, pixel)
+
+                # Caso as 3 normais tiverem o mesmo sinal (+ ou -) 
+                # ou forem iguais, o pixel está dentro do triangulo p0-p1-p2
                 return (a >= 0 and b >= 0 and c >= 0) or (a <= 0 and b <= 0 and c <= 0)
 
 
-            xs = [p[0] for p in vertices]
-            ys = [p[1] for p in vertices]
+            vertices = np.array(vertices)
 
-            x_min = round(min(xs))
-            x_max = round(max(xs))
-
-            y_min = round(min(ys))
-            y_max = round(max(ys))
+            x_min, y_min = [round(min(vertices[:,i])) for i in range(2)]
+            x_max, y_max = [round(max(vertices[:,i])) for i in range(2)]
 
 
             for y in range(y_min, y_max+1):
