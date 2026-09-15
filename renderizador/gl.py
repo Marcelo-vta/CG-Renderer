@@ -24,9 +24,24 @@ class GL:
     near = 0.01   # plano de corte próximo
     far = 1000    # plano de corte distante
 
-    viewpoint_val = np.array()
-    transform_in_val = np.array()
-    transform_out_val = np.array()
+    viewpoint_val = np.eye(4)
+    transform_stack = [np.eye(4)]
+
+    @staticmethod
+    def draw(coord, color):
+
+        fb_dim = gpu.GPU.frame_buffer[gpu.GPU.draw_framebuffer].color.shape
+
+        if coord[0] > fb_dim[1]-1:
+            return
+        if coord[0] < 0:
+            return
+        if coord[1] > fb_dim[0]-1:
+            return
+        if coord[1] < 0:
+            return
+
+        gpu.GPU.draw_pixel(coord, gpu.GPU.RGB8, color)
 
     @staticmethod
     def setup(width, height, near=0.01, far=1000):
@@ -80,20 +95,6 @@ class GL:
 
         def desenha_linha(p0, p1, color):
 
-            def draw(coord, color):
-
-                fb_dim = gpu.GPU.frame_buffer[gpu.GPU.draw_framebuffer].color.shape
-            
-                if coord[0] > fb_dim[1]-1:
-                    return
-                if coord[0] < 0:
-                    return
-                if coord[1] > fb_dim[0]-1:
-                    return
-                if coord[1] < 0:
-                    return
-    
-                gpu.GPU.draw_pixel(coord, gpu.GPU.RGB8, color)
 
             dx = p1[0] - p0[0]
             dy = p1[1] - p0[1]
@@ -101,7 +102,7 @@ class GL:
             steps = round(max(abs(dx), abs(dy)))
 
             if steps == 0:
-                draw([round(p0[0]), round(p0[1])], color)
+                GL.draw([round(p0[0]), round(p0[1])], color)
 
             angle_x = dx/steps
             angle_y = dy/steps
@@ -111,7 +112,7 @@ class GL:
                 u = p0[0] + angle_x * i
                 v = p0[1] + angle_y * i
 
-                draw([int(u), int(v)], color)
+                GL.draw([int(u), int(v)], color)
 
             return
         
@@ -198,23 +199,7 @@ class GL:
         # Já point[2] é a coordenada x do segundo ponto e assim por diante. Assuma que a
         # quantidade de pontos é sempre multiplo de 3, ou seja, 6 valores ou 12 valores, etc.
         # O parâmetro colors é um dicionário com os tipos cores possíveis, para o TriangleSet2D
-        # você pode assumir inicialmente o desenho das linhas com a cor emissiva (emissiveColor).
-
-        fb_dim = gpu.GPU.frame_buffer[gpu.GPU.draw_framebuffer].color.shape
-
-        def draw(coord, color, fb_dim):
-
-            if coord[0] > fb_dim[1]-1:
-                return
-            if coord[0] < 0:
-                return
-            if coord[1] > fb_dim[0]-1:
-                return
-            if coord[1] < 0:
-                return
-
-            gpu.GPU.draw_pixel(coord, gpu.GPU.RGB8, color)
-            
+        # você pode assumir inicialmente o desenho das linhas com a cor emissiva (emissiveColor).         
         
         points = list(zip((vertices[::2]), vertices[1::2]))
         triangles = list(zip((points[::3]), points[1::3], points[2::3]))
@@ -244,14 +229,87 @@ class GL:
             for y in range(y_min, y_max+1):
                 for x in range(x_min, x_max + 1):
                     if inside(vertices[0], vertices[1], vertices[2], (x,y)):
-                        # gpu.GPU.draw_pixel([x,y], gpu.GPU.RGB8, color)
-                        draw([x,y], color, fb_dim)
+                        GL.draw([x,y], color)
 
         for triangle in triangles:
             triangleSingle2D(triangle, emissive_color)
 
-            
+    @staticmethod
+    def quat_rotation(axis, rad):
 
+        if rad == 0:
+            return np.eye(4)
+
+        if not any(axis):
+            return np.eye(4)
+
+        axis = np.array(axis)
+        axis = axis / np.linalg.norm(axis)
+
+        q = [u*(np.sin(rad/2)) for u in axis]
+        q += [np.cos(rad/2)]
+
+        qi, qj, qk, qr = q
+
+        return np.array([
+            [ 1 - 2*(qj**2 + qk**2),      2*(qi*qj - qk*qr),     2*(qi*qk + qj*qr), 0],
+            [ 2*(qi * qj + qk * qr),    1 - 2*(qi**2 + qk**2),   2*(qj*qk - qi*qr), 0],
+            [ 2*(qi*qk - qj*qr),        2*(qj*qk + qi*qr),   1 - 2*(qi**2 + qj**2), 0],
+            [        0,                  0,                  0,            1]
+        ])
+
+    @staticmethod
+    def lookAt(pos, axis, rad):
+
+        rot = GL.quat_rotation(axis, rad)
+        inv_rot = np.linalg.inv(rot)
+
+        pos = np.array(pos)
+
+        base = np.eye(4)
+        base[:3, 3] = pos
+
+        pos = base
+        inv_pos = np.linalg.inv(pos)
+
+        return inv_rot @ inv_pos
+
+    @staticmethod
+    def projection_matrix(near, far, fovy, aspect):
+
+        top = near * np.tan(fovy/2)
+        right = top * aspect
+
+        proj_m = np.diag([near/right, near/top, -((far+near)/(far-near)), 0])
+        proj_m[2,3] = (-2*far*near)/(far-near)
+        proj_m[3,2] = -1
+
+        return proj_m
+
+    @staticmethod
+    def homogenous_div(m):
+        return m @ np.diag(1/m[3])
+
+    @staticmethod
+    def scaling(axis):
+        return np.diag([*axis, 1])
+
+    @staticmethod
+    def translate(axis):
+        base = np.eye(4)
+        base[:3,3] = axis
+
+        return base
+
+
+    @staticmethod
+    def screen_matrix(W, H):
+        matrix = np.diag((W/2, -(H/2), 1, 1))
+        matrix[:2,3] = np.array([W/2, H/2])
+
+        return matrix
+
+            
     @staticmethod
     def triangleSet(point, colors):
         """Função usada para renderizar TriangleSet."""
@@ -273,11 +331,47 @@ class GL:
         print("TriangleSet : pontos = {0}".format(point)) # imprime no terminal pontos
         print("TriangleSet : colors = {0}".format(colors)) # imprime no terminal as cores
 
+        color = colors["emissiveColor"]
+        color = np.array(color) * 255
+
         points = list(zip((point[::3]), point[1::3], point[2::3]))
         triangles = list(zip((points[::3]), points[1::3], points[2::3]))
 
-        # Exemplo de desenho de um pixel branco na coordenada 10, 10
-        gpu.GPU.draw_pixel([10, 10], gpu.GPU.RGB8, [255, 255, 255])  # altera pixel
+        def semiplane(a, b, p):
+            return (p[0]-a[0])*(b[1]-a[1]) - (p[1]-a[1])*(b[0]-a[0])
+
+        def inside(p0, p1, p2, pixel):
+            a, b, c = semiplane(p0, p1, pixel), semiplane(p1, p2, pixel), semiplane(p2, p0, pixel)
+            return (a >= 0 and b >= 0 and c >= 0) or (a <= 0 and b <= 0 and c <= 0)
+
+        for triangle in triangles:
+
+            triangle = np.transpose(np.array(triangle))
+
+            homogenous_triangle = np.eye(4)
+            homogenous_triangle[:3,:3] = triangle
+            homogenous_triangle[3] = [1] * len(homogenous_triangle[3])
+
+            T = GL.transform_stack[-1]
+            vp = GL.viewpoint_val
+
+            t_triangle = T @ homogenous_triangle
+            vp_triangle = vp @ t_triangle
+
+            f_triangle = GL.homogenous_div(vp_triangle)
+            t_ = np.transpose(f_triangle[:2,:3])
+
+            x_min = round(min(t_[:,0]))
+            x_max = round(max(t_[:,0]))
+
+            y_min = round(min(t_[:,1]))
+            y_max = round(max(t_[:,1]))
+
+            for y in range(y_min, y_max+1):
+                for x in range(x_min, x_max + 1):
+                    if inside(t_[0], t_[1], t_[2], (x,y)):
+                        GL.draw([x,y], color)
+            
 
     @staticmethod
     def viewpoint(position, orientation, fieldOfView):
@@ -292,7 +386,20 @@ class GL:
         print("orientation = {0} ".format(orientation), end='')
         print("fieldOfView = {0} ".format(fieldOfView))
 
-        # Calcular matriz e salvar na variavel da classe
+        # Coordenadas da câmera
+        lkat = GL.lookAt(position, orientation[:3], orientation[3])
+
+        # Projeção perspectiva
+        aspect = GL.width/GL.height
+        p_proj = GL.projection_matrix(GL.near, GL.far, fieldOfView, aspect)
+
+        # Screen Transform
+        screen = GL.screen_matrix(GL.width, GL.height)
+
+        vp = screen @ p_proj @ lkat
+
+        # Matriz de viewpoint sem divisão homogênea
+        GL.viewpoint_val = vp
 
         
 
@@ -310,17 +417,26 @@ class GL:
         # Quando começar a usar Transforms dentre de outros Transforms, mais a frente no curso
         # Você precisará usar alguma estrutura de dados pilha para organizar as matrizes.
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("Transform : ", end='')
-        if translation:
-            print("translation = {0} ".format(translation), end='') # imprime no terminal
+        print()
+        print("Entrando em transform ---------------------------------------")
+        print()
+
+        T = np.eye(4)
+
         if scale:
-            print("scale = {0} ".format(scale), end='') # imprime no terminal
+            print(f"Scale: {scale}")
+            T = GL.scaling(scale) @ T
         if rotation:
-            print("rotation = {0} ".format(rotation), end='') # imprime no terminal
-        print("")
-        
-        # Calcular matriz e salvar na variavel da classe
+            print(f"Rotation: {rotation}")
+            T = GL.quat_rotation(rotation[:3], rotation[3]) @ T
+        if translation:
+            print(f"Translation: {translation}")
+            T = GL.translate(translation) @ T
+
+        GL.transform_stack.append( GL.transform_stack[-1] @ T)
+
+        print("transform atual:")
+        print(np.array(GL.transform_stack[-1]))
 
     @staticmethod
     def transform_out():
@@ -331,7 +447,12 @@ class GL:
         # pilha implementada.
 
         # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("Saindo de Transform")
+       
+        print()
+        print("Saindo de transform ---------------------------------------")
+        print()
+
+        GL.transform_stack.pop(-1)
 
     @staticmethod
     def triangleStripSet(point, stripCount, colors):
@@ -348,15 +469,27 @@ class GL:
         # depois 2, 3 e 4, e assim por diante. Cuidado com a orientação dos vértices, ou seja,
         # todos no sentido horário ou todos no sentido anti-horário, conforme especificado.
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("TriangleStripSet : pontos = {0} ".format(point), end='')
-        for i, strip in enumerate(stripCount):
-            print("strip[{0}] = {1} ".format(i, strip), end='')
-        print("")
-        print("TriangleStripSet : colors = {0}".format(colors)) # imprime no terminal as cores
+        points = list(zip((point[::3]), point[1::3], point[2::3]))
 
-        # Exemplo de desenho de um pixel branco na coordenada 10, 10
-        gpu.GPU.draw_pixel([10, 10], gpu.GPU.RGB8, [255, 255, 255])  # altera pixel
+        strips = []
+
+        for i, n in enumerate(stripCount):
+            strips.append([points[j+stripCount[i-1]] if i>0 else points[j] for j in range(n)])
+
+        for strip in strips:
+            triangles = list(zip(points, points[1:], points[2:]))
+            triangles = [(t[2], t[1], t[0]) if i // 2 == 1 else t for i, t in enumerate(triangles) ]
+
+            t_set = np.array(triangles).flatten().tolist()
+            
+            GL.triangleSet(t_set, colors)
+
+            # print("Triangles ------------------------")
+            # for i, triangle in enumerate(triangles):
+            #     print(f"{triangle} -- {i}")
+        
+                
+        
 
     @staticmethod
     def indexedTriangleStripSet(point, index, colors):
@@ -378,13 +511,33 @@ class GL:
         print("IndexedTriangleStripSet : pontos = {0}, index = {1}".format(point, index))
         print("IndexedTriangleStripSet : colors = {0}".format(colors)) # imprime as cores
 
-        # Exemplo de desenho de um pixel branco na coordenada 10, 10
-        gpu.GPU.draw_pixel([10, 10], gpu.GPU.RGB8, [255, 255, 255])  # altera pixel
+        points = list(zip((point[::3]), point[1::3], point[2::3]))
+
+        strips = []
+        current_strip = []
+
+        for id in index:
+
+            if id == -1:
+                strips.append(current_strip)
+                current_strip = []
+            else:
+                current_strip.append(id)
+
+
+        for strip in strips:
+            values = np.array([points[i] for i in strip]).flatten().tolist()
+
+            GL.triangleStripSet(values, [len(strip)], colors)
+
 
     @staticmethod
     def indexedFaceSet(coord, coordIndex, colorPerVertex, color, colorIndex,
                        texCoord, texCoordIndex, colors, current_texture):
         """Função usada para renderizar IndexedFaceSet."""
+
+        # Parte 1
+
         # https://www.web3d.org/specifications/X3Dv4/ISO-IEC19775-1v4-IS/Part01/components/geometry3D.html#IndexedFaceSet
         # A função indexedFaceSet é usada para desenhar malhas de triângulos. Ela funciona de
         # forma muito simular a IndexedTriangleStripSet porém com mais recursos.
@@ -398,6 +551,11 @@ class GL:
         # seguintes e depois este mesmo primeiro ponto com o terçeiro e quarto ponto. Por exemplo: numa
         # sequencia 0, 1, 2, 3, 4, -1 o primeiro triângulo será com os vértices 0, 1 e 2, depois serão
         # os vértices 0, 2 e 3, e depois 0, 3 e 4, e assim por diante, até chegar no final da lista.
+
+
+        # Parte 2   
+
+
         # Adicionalmente essa implementação do IndexedFace aceita cores por vértices, assim
         # se a flag colorPerVertex estiver habilitada, os vértices também possuirão cores
         # que servem para definir a cor interna dos poligonos, para isso faça um cálculo
@@ -423,6 +581,35 @@ class GL:
 
         # Exemplo de desenho de um pixel branco na coordenada 10, 10
         gpu.GPU.draw_pixel([10, 10], gpu.GPU.RGB8, [255, 255, 255])  # altera pixel
+
+        points = list(zip((coord[::3]), coord[1::3], coord[2::3]))
+
+        faces = []
+        current_face = []
+        
+        for id in coordIndex:
+
+            if id == -1:
+                faces.append(current_face)
+                current_face = []
+            else:
+                current_face.append(points[id])
+
+        for face in faces:
+            triangles = list(zip([face[0]]*len(face), face[1:], face[2:]))
+            triangles += [(face[0], face[-2], face[-1])]
+            
+            # triangles = [(t[2], t[1], t[0]) if i // 2 == 1 else t for i, t in enumerate(triangles) ]
+
+            t_set = np.array(triangles).flatten().tolist()
+            
+            GL.triangleSet(t_set, colors)
+
+            # print("Triangles ------------------------")
+            # for i, triangle in enumerate(triangles):
+            #     print(f"{triangle} -- {i}")
+
+
 
     @staticmethod
     def box(size, colors):
