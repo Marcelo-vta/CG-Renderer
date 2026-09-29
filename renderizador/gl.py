@@ -27,6 +27,8 @@ class GL:
     viewpoint_val = np.eye(4) # Matriz de viewpoint
     transform_stack = [np.eye(4)] # Pilha de matrizes de transformação
 
+    texture_buffer = []
+
     @staticmethod
     def draw(coord, color):
 
@@ -226,6 +228,7 @@ class GL:
 
             vertices = np.array(vertices)
 
+            # Bounding box
             x_min, y_min = [round(min(vertices[:,i])) for i in range(2)]
             x_max, y_max = [round(max(vertices[:,i])) for i in range(2)]
 
@@ -240,6 +243,10 @@ class GL:
 
     @staticmethod
     def quat_rotation(axis, rad):
+        """ 
+        Recebe axis : [x, y, z] e rad :  o angulo de rotação em radianos
+        Retorna a matriz de rotação por quatérnios (np.array 4x4)
+        """
 
         if rad == 0:
             return np.eye(4)
@@ -250,11 +257,18 @@ class GL:
         axis = np.array(axis)
         axis = axis / np.linalg.norm(axis)
 
+        # q é o vetor coluna: [x*seno(rad/2), y*seno(rad/2), z*seno(rad/2), cos(rad/2)]
         q = [u*(np.sin(rad/2)) for u in axis]
         q += [np.cos(rad/2)]
 
+        # qi = x*seno(rad/2)
+        # qj = y*seno(rad/2)
+        # qk = z*seno(rad/2)
+        # qr = cos(rad/2)
         qi, qj, qk, qr = q
 
+
+        # Formula da matriz de rotação em quatérnios
         return np.array([
             [ 1 - 2*(qj**2 + qk**2),      2*(qi*qj - qk*qr),     2*(qi*qk + qj*qr), 0],
             [ 2*(qi * qj + qk * qr),    1 - 2*(qi**2 + qk**2),   2*(qj*qk - qi*qr), 0],
@@ -264,6 +278,10 @@ class GL:
 
     @staticmethod
     def lookAt(pos, axis, rad):
+        """
+        Recebe a posição (pos) e o ângulo (axis, rad) da câmera
+        retorna o inverso da rotação e a matriz de translação inversa da posição
+        """
 
         rot = GL.quat_rotation(axis, rad)
         inv_rot = np.linalg.inv(rot)
@@ -272,8 +290,8 @@ class GL:
 
         base = np.eye(4)
         base[:3, 3] = pos
-
         pos = base
+
         inv_pos = np.linalg.inv(pos)
 
         return inv_rot @ inv_pos
@@ -315,7 +333,7 @@ class GL:
 
             
     @staticmethod
-    def triangleSet(point, colors):
+    def triangleSet(point, colors, vertexColor = None):
         """Função usada para renderizar TriangleSet."""
         # https://www.web3d.org/specifications/X3Dv4/ISO-IEC19775-1v4-IS/Part01/components/rendering.html#TriangleSet
         # Nessa função você receberá pontos no parâmetro point, esses pontos são uma lista
@@ -338,8 +356,13 @@ class GL:
         color = colors["emissiveColor"]
         color = np.array(color) * 255
 
-        points = list(zip((point[::3]), point[1::3], point[2::3]))
-        triangles = list(zip((points[::3]), points[1::3], points[2::3]))
+        pointsCoords = list(zip((point[::3]), point[1::3], point[2::3]))
+        trianglesCoords = list(zip((pointsCoords[::3]), pointsCoords[1::3], pointsCoords[2::3]))
+
+        if vertexColor != None:
+            pointsColors = list(zip((vertexColor[::3]), vertexColor[1::3], vertexColor[2::3]))
+            trianglesColors = list(zip((pointsColors[::3]), pointsColors[1::3], pointsColors[2::3]))
+        
 
         def semiplane(a, b, p):
             return (p[0]-a[0])*(b[1]-a[1]) - (p[1]-a[1])*(b[0]-a[0])
@@ -348,8 +371,49 @@ class GL:
             a, b, c = semiplane(p0, p1, pixel), semiplane(p1, p2, pixel), semiplane(p2, p0, pixel)
             return (a >= 0 and b >= 0 and c >= 0) or (a <= 0 and b <= 0 and c <= 0)
 
-        for triangle in triangles:
+        def barycentric(triangle, target):
+            # Retorna True se o pixel estiver dentro do triangulo abc,
+            # caso contrário retorna False
 
+            p0, p1, p2 = triangle
+
+            # As normais entre as retas p0-p1 p1-p2 p2-p0
+            c = semiplane(p0,p1, target)
+            c, a, b = semiplane(p0, p1, target), semiplane(p1, p2, target), semiplane(p2, p0, target)
+
+            # Retorna [-1, -1, -1] se o target estiver fora do triangulo
+            if not (a >= 0 and b >= 0 and c >= 0) and \
+                    not (a <= 0 and b <= 0 and c <= 0):
+                
+                return None
+
+            # Normalizando 𝛼,𝛽,𝛾
+            a_, b_, c_ = [np.abs(x)/np.abs(a+b+c) for x in (a,b,c)]
+
+            return a_, b_, c_ 
+            # z no espaco da camera
+
+
+
+            # Retorna as normais normalizadas (𝛼,𝛽,𝛾)
+
+        def interpolate_colors(triangle, colors, target, z_):
+
+            bc = barycentric(triangle, target)
+
+            z0, z1, z2 = z_
+            a_, b_, c_ = bc
+
+            cameraZ = 1 / ((a_ * (1/z0)) + (b_ * (1/z1)) + (c_ * (1/z2)))
+
+            clr = np.array([colors[i] * bc[i] / z_[i] for i in range(len(colors))]).T
+            test = clr.sum(1) * cameraZ * 255
+
+            return [math.floor(cl) for cl in test]
+        
+        for i in range(len(trianglesCoords)):
+
+            triangle = trianglesCoords[i]
             triangle = np.transpose(np.array(triangle))
 
             homogenous_triangle = np.eye(4)
@@ -363,18 +427,33 @@ class GL:
             vp_triangle = vp @ t_triangle
 
             f_triangle = GL.homogenous_div(vp_triangle)
+
             t_ = np.transpose(f_triangle[:2,:3])
+            z_ = np.transpose(vp_triangle[3,:3])
 
-            x_min = round(min(t_[:,0]))
-            x_max = round(max(t_[:,0]))
+            x_min = math.floor(min(t_[:,0]))
+            x_max = math.floor(max(t_[:,0]))
 
-            y_min = round(min(t_[:,1]))
-            y_max = round(max(t_[:,1]))
+            y_min = math.floor(min(t_[:,1]))
+            y_max = math.floor(max(t_[:,1]))
+
+            if vertexColor != None:
+                triangleColors = np.asarray(trianglesColors[i])
+
 
             for y in range(y_min, y_max+1):
                 for x in range(x_min, x_max + 1):
-                    if inside(t_[0], t_[1], t_[2], (x,y)):
-                        GL.draw([x,y], color)
+
+                    target = (x + 0.5, y + 0.5)
+                    bc = barycentric(t_, (target))
+
+                    if bc != None:
+                        if vertexColor != None:
+                            GL.draw([x,y], interpolate_colors(t_, triangleColors, target, z_))
+
+                        else:
+                            GL.draw([x,y], color)
+                    
             
 
     @staticmethod
@@ -421,26 +500,16 @@ class GL:
         # Quando começar a usar Transforms dentre de outros Transforms, mais a frente no curso
         # Você precisará usar alguma estrutura de dados pilha para organizar as matrizes.
 
-        print()
-        print("Entrando em transform ---------------------------------------")
-        print()
-
         T = np.eye(4)
 
         if scale:
-            print(f"Scale: {scale}")
             T = GL.scaling(scale) @ T
         if rotation:
-            print(f"Rotation: {rotation}")
             T = GL.quat_rotation(rotation[:3], rotation[3]) @ T
         if translation:
-            print(f"Translation: {translation}")
             T = GL.translate(translation) @ T
 
         GL.transform_stack.append( GL.transform_stack[-1] @ T)
-
-        print("transform atual:")
-        print(np.array(GL.transform_stack[-1]))
 
     @staticmethod
     def transform_out():
@@ -451,10 +520,6 @@ class GL:
         # pilha implementada.
 
         # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-       
-        print()
-        print("Saindo de transform ---------------------------------------")
-        print()
 
         GL.transform_stack.pop(-1)
 
@@ -586,28 +651,54 @@ class GL:
         # Exemplo de desenho de um pixel branco na coordenada 10, 10
         gpu.GPU.draw_pixel([10, 10], gpu.GPU.RGB8, [255, 255, 255])  # altera pixel
 
-        points = list(zip((coord[::3]), coord[1::3], coord[2::3]))
+        points = np.array(list(zip((coord[::3]), coord[1::3], coord[2::3])))
 
-        faces = []
-        current_face = []
-        
-        for id in coordIndex:
+        ci = np.array(coordIndex)
+        sep = np.where(ci == -1)[0]
 
-            if id == -1:
-                faces.append(current_face)
-                current_face = []
+        facesCoords = np.split(points[np.delete(ci,sep)], sep - np.arange(len(sep)))[:-1]
+
+        if colorPerVertex:
+            vertexColors = np.array(list(zip((color[::3]), color[1::3], color[2::3])))
+            facesColors = np.split(vertexColors[np.delete(ci,sep)], sep - np.arange(len(sep)))[:-1]
+
+        if current_texture:
+            textureCoord = np.array(list(zip((texCoord[::2]), texCoord[1::2])))
+            facesTexture = np.split(textureCoord[np.delete(ci,sep)], sep - np.arange(len(sep)))[:-1]
+
+        for i in range(len(facesCoords)):
+
+            faceCoords = facesCoords[i]
+
+            trianglesCoords = list(zip([faceCoords[0]]*len(faceCoords), faceCoords[1:], faceCoords[2:]))
+            trianglesCoords += [(faceCoords[0], faceCoords[-2], faceCoords[-1])]
+
+            t_setCoords = np.array(trianglesCoords).flatten().tolist()
+
+            if colorPerVertex:
+                faceColors = facesColors[i]
+
+                trianglesColors = list(zip([faceColors[0]]*len(faceColors), faceColors[1:], faceColors[2:]))
+                trianglesColors += [(faceColors[0], faceColors[-2], faceColors[-1])]
+
+                t_setColors = np.array(trianglesColors).flatten().tolist()
             else:
-                current_face.append(points[id])
+                t_setColors = None
 
-        for face in faces:
-            triangles = list(zip([face[0]]*len(face), face[1:], face[2:]))
-            triangles += [(face[0], face[-2], face[-1])]
-            
+            if current_texture:
+                faceTexture = facesTexture[i]
+                GL.texture_buffer = gpu.GPU.load_texture(current_texture[0])
+
+                trianglesTexture = list(zip([faceTexture[0]]*len(faceTexture), faceTexture[1:], faceTexture[2:]))
+                trianglesTexture += [(faceTexture[0], faceTexture[-2], faceTexture[-1])]
+
+                t_setTexture = np.array(trianglesTexture).flatten().tolist()
+            else:
+                t_setTexture = None
             # triangles = [(t[2], t[1], t[0]) if i // 2 == 1 else t for i, t in enumerate(triangles) ]
 
-            t_set = np.array(triangles).flatten().tolist()
             
-            GL.triangleSet(t_set, colors)
+            GL.triangleSet(t_setCoords, colors, t_setColors, t_setTexture)
 
             # print("Triangles ------------------------")
             # for i, triangle in enumerate(triangles):
