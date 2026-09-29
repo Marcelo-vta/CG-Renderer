@@ -333,7 +333,7 @@ class GL:
 
             
     @staticmethod
-    def triangleSet(point, colors, vertexColor = None):
+    def triangleSet(point, colors, vertexColor = None, textureCoords = None):
         """Função usada para renderizar TriangleSet."""
         # https://www.web3d.org/specifications/X3Dv4/ISO-IEC19775-1v4-IS/Part01/components/rendering.html#TriangleSet
         # Nessa função você receberá pontos no parâmetro point, esses pontos são uma lista
@@ -356,12 +356,18 @@ class GL:
         color = colors["emissiveColor"]
         color = np.array(color) * 255
 
+        txt = GL.texture_buffer
+
         pointsCoords = list(zip((point[::3]), point[1::3], point[2::3]))
         trianglesCoords = list(zip((pointsCoords[::3]), pointsCoords[1::3], pointsCoords[2::3]))
 
         if vertexColor != None:
             pointsColors = list(zip((vertexColor[::3]), vertexColor[1::3], vertexColor[2::3]))
             trianglesColors = list(zip((pointsColors[::3]), pointsColors[1::3], pointsColors[2::3]))
+
+        if textureCoords != None:
+            texturePoints = list(zip((textureCoords[::2]), textureCoords[1::2]))
+            trianglesTexture = list(zip((texturePoints[::3]), texturePoints[1::3], texturePoints[2::3]))
         
 
         def semiplane(a, b, p):
@@ -391,13 +397,9 @@ class GL:
             a_, b_, c_ = [np.abs(x)/np.abs(a+b+c) for x in (a,b,c)]
 
             return a_, b_, c_ 
-            # z no espaco da camera
 
 
-
-            # Retorna as normais normalizadas (𝛼,𝛽,𝛾)
-
-        def interpolate_colors(triangle, colors, target, z_):
+        def interpolate_values(triangle, values, target, z_):
 
             bc = barycentric(triangle, target)
 
@@ -406,10 +408,10 @@ class GL:
 
             cameraZ = 1 / ((a_ * (1/z0)) + (b_ * (1/z1)) + (c_ * (1/z2)))
 
-            clr = np.array([colors[i] * bc[i] / z_[i] for i in range(len(colors))]).T
-            test = clr.sum(1) * cameraZ * 255
+            clr = np.array([values[i] * bc[i] / z_[i] for i in range(len(values))]).T
+            
+            return clr.sum(1) * cameraZ
 
-            return [math.floor(cl) for cl in test]
         
         for i in range(len(trianglesCoords)):
 
@@ -440,6 +442,9 @@ class GL:
             if vertexColor != None:
                 triangleColors = np.asarray(trianglesColors[i])
 
+            if textureCoords != None:
+                triangleTexture = np.asarray(trianglesTexture[i])
+
 
             for y in range(y_min, y_max+1):
                 for x in range(x_min, x_max + 1):
@@ -449,7 +454,19 @@ class GL:
 
                     if bc != None:
                         if vertexColor != None:
-                            GL.draw([x,y], interpolate_colors(t_, triangleColors, target, z_))
+                            interpolated = interpolate_values(t_, triangleColors, target, z_) * 255
+                            GL.draw([x,y], [math.floor(x) for x in interpolated])
+
+                        if textureCoords != None:
+                    
+                            interpolated = interpolate_values(t_, triangleTexture, target, z_)
+                            interpolated = interpolated @ np.diag(GL.texture_buffer.shape[:2])
+
+                            interpolated[1] = GL.texture_buffer.shape[1] - interpolated[1]
+
+                            value = GL.texture_buffer[*[math.floor(x) for x in interpolated]]
+
+                            GL.draw([x,y], value[:3])
 
                         else:
                             GL.draw([x,y], color)
