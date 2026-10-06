@@ -24,10 +24,31 @@ class GL:
     near = 0.01   # plano de corte próximo
     far = 1000    # plano de corte distante
 
-    viewpoint_val = np.eye(4) # Matriz de viewpoint
+    viewpoint_val = np.eye(4) # Matriz de viewpoint (tela @ projeção @ câmera)
     transform_stack = [np.eye(4)] # Pilha de matrizes de transformação
 
-    texture_buffer = []
+    # Posição e rotação da câmera no mundo, usadas no vetor até o observador e no headlight
+    eye_position = np.zeros(3)
+    eye_rotation = np.eye(3)
+
+    # Luzes da cena, reiniciadas a cada frame em clear_buffers (o headlight vem do NavigationInfo)
+    headlight = False
+    lights = []
+
+    # Texturas já lidas, com todos os níveis do mipmap: nome do arquivo -> [nível 0, nível 1, ...]
+    texture_cache = {}
+
+    # Instante em que a animação começou (primeira chamada do TimeSensor)
+    start_time = None
+
+    # Buffers de supersampling (4 samples por pixel). Os triângulos só escrevem neles; quem
+    # converte o resultado em imagem é o render_buffer, uma única vez por frame.
+    # Posição (x, y) de cada sample dentro do pixel, no padrão RGSS 2x2 (grade 4x4 com um
+    # sample por linha e por coluna)
+    offsets = np.array([[0.625, 0.125], [0.125, 0.375], [0.875, 0.625], [0.375, 0.875]])
+    depth_buffer = np.full((height, width, 4), np.inf)  # distância até a câmera de cada sample
+    color_buffer = np.zeros((height, width, 4, 3))      # cor (0 a 255) de cada sample
+    touched = np.zeros((height, width), dtype=bool)     # pixels em que algum sample foi desenhado
 
     @staticmethod
     def draw(coord, color):
@@ -53,6 +74,39 @@ class GL:
         GL.near = near
         GL.far = far
 
+        GL.depth_buffer = np.full((height, width, 4), np.inf)
+        GL.color_buffer = np.zeros((height, width, 4, 3))
+        GL.touched = np.zeros((height, width), dtype=bool)
+        GL.start_time = None
+
+    @staticmethod
+    def clear_buffers():
+        """Reinicia os buffers de supersampling e as luzes (chamar uma vez no início de cada frame)."""
+        GL.depth_buffer.fill(np.inf)                  # nenhum sample foi coberto ainda
+        GL.color_buffer[:] = gpu.GPU.clear_color_val  # samples começam com a cor de fundo
+        GL.touched.fill(False)
+
+        # As luzes são lidas de novo a cada frame, pois o traversal do grafo de cena as repete
+        GL.lights = []
+        GL.headlight = False
+
+    @staticmethod
+    def render_buffer():
+        """Renderiza o buffer de supersampling no framebuffer (chamar uma vez no fim de cada frame)."""
+        fb = gpu.GPU.frame_buffer[gpu.GPU.draw_framebuffer].color
+
+        # Só mexe nos pixels em que algum sample foi desenhado, assim o que já estava no
+        # framebuffer (fundo, desenhos 2D feitos direto com GL.draw) é preservado
+        covered = GL.touched
+        if not covered.any():
+            return
+
+        # Cor do pixel = média da cor dos seus samples (os não cobertos têm a cor de fundo)
+        pixels = GL.color_buffer[covered].mean(axis=1)
+        fb[covered, :3] = np.clip(np.rint(pixels), 0, 255).astype(np.uint8)
+
+
+
     @staticmethod
     def polypoint2D(point, colors):
         """Função usada para renderizar Polypoint2D."""
@@ -73,8 +127,8 @@ class GL:
         # Rever a correção para int
         for p in points:
             gpu.GPU.draw_pixel([int(p[0]), int(p[1])], gpu.GPU.RGB8, chosen_color)
-        
-        
+
+
     @staticmethod
     def polyline2D(lineSegments, colors):
         """Função usada para renderizar Polyline2D."""
@@ -117,7 +171,7 @@ class GL:
                 GL.draw([int(u), int(v)], color)
 
             return
-        
+
 
         for i in range(len(points)):
             if not i >= len(points)-1:
@@ -125,7 +179,7 @@ class GL:
                 p1 = points[i+1]
                 desenha_linha(p0,p1, chosen_color)
 
-                
+
     # Não funciona o algoritmo de desenhar a partir de vizinhos.
     # Eventualmente implementar pelo diverencial do theta
     # vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv
@@ -142,7 +196,7 @@ class GL:
         print("Circle2D : colors = {0}".format(colors)) # imprime no terminal as cores
 
         radius = 8
-        
+
         chosen_color = [int(i*255) for i in colors["emissiveColor"]]
 
         def distance(p0, p1):
@@ -169,7 +223,7 @@ class GL:
                             best_option = new_point
 
             return (best_option, current_point)
-        
+
 
         center = (GL.width//2, GL.height//2)
 
@@ -201,49 +255,21 @@ class GL:
         # Já point[2] é a coordenada x do segundo ponto e assim por diante. Assuma que a
         # quantidade de pontos é sempre multiplo de 3, ou seja, 6 valores ou 12 valores, etc.
         # O parâmetro colors é um dicionário com os tipos cores possíveis, para o TriangleSet2D
-        # você pode assumir inicialmente o desenho das linhas com a cor emissiva (emissiveColor).         
-        
-        points = list(zip((vertices[::2]), vertices[1::2]))
-        triangles = list(zip((points[::3]), points[1::3], points[2::3]))
+        # você pode assumir inicialmente o desenho das linhas com a cor emissiva (emissiveColor).
 
-        emissive_color = [int(i*255) for i in colors["emissiveColor"]]
+        points = np.asarray(vertices, dtype=float).reshape(-1, 2)
+        emissive_color = np.clip(np.asarray(colors["emissiveColor"], dtype=float), 0, 1) * 255
 
-        def triangleSingle2D(vertices, color):
-
-            def semiplane(a, b, p):
-                # Retorna a normal da reta a-b em relação ao ponto p
-                return (p[0]-a[0])*(b[1]-a[1]) - (p[1]-a[1])*(b[0]-a[0])
-
-            def inside(p0, p1, p2, pixel):
-                # Retorna True se o pixel estiver dentro do triangulo abc,
-                # caso contrário retorna False
-
-                # As normais entre as retas p0-p1 p1-p2 p2-p0
-                a, b, c = semiplane(p0, p1, pixel), semiplane(p1, p2, pixel), semiplane(p2, p0, pixel)
-
-                # Caso as 3 normais tiverem o mesmo sinal (+ ou -) 
-                # ou forem iguais, o pixel está dentro do triangulo p0-p1-p2
-                return (a >= 0 and b >= 0 and c >= 0) or (a <= 0 and b <= 0 and c <= 0)
-
-
-            vertices = np.array(vertices)
-
-            # Bounding box
-            x_min, y_min = [round(min(vertices[:,i])) for i in range(2)]
-            x_max, y_max = [round(max(vertices[:,i])) for i in range(2)]
-
-
-            for y in range(y_min, y_max+1):
-                for x in range(x_min, x_max + 1):
-                    if inside(vertices[0], vertices[1], vertices[2], (x,y)):
-                        GL.draw([x,y], color)
-
-        for triangle in triangles:
-            triangleSingle2D(triangle, emissive_color)
+        # Os triângulos 2D já estão em coordenadas de tela, então não há projeção nem profundidade.
+        # Cada um é rasterizado nos buffers de supersampling, o que suaviza as bordas, e o último
+        # triângulo desenhado cobre os anteriores (sem teste de profundidade).
+        for i in range(0, len(points) - 2, 3):
+            GL.rasterize(points[i:i + 3], np.ones(3), None,
+                         lambda n, attr, attr_dx, attr_dy: emissive_color, depth_test=False)
 
     @staticmethod
     def quat_rotation(axis, rad):
-        """ 
+        """
         Recebe axis : [x, y, z] e rad :  o angulo de rotação em radianos
         Retorna a matriz de rotação por quatérnios (np.array 4x4)
         """
@@ -331,9 +357,285 @@ class GL:
 
         return matrix
 
-            
     @staticmethod
-    def triangleSet(point, colors, vertexColor = None, textureCoords = None):
+    def normalize(v):
+        """Normaliza vetores (um por linha, ou um vetor só); os vetores nulos continuam nulos."""
+        v = np.asarray(v, dtype=float)
+        norm = np.linalg.norm(v, axis=-1, keepdims=True)
+        return np.divide(v, norm, out=np.zeros_like(v), where=norm > 1e-12)
+
+    @staticmethod
+    def split_faces(index):
+        """Divide uma lista de índices separada por -1 em uma lista de faces."""
+        faces, current = [], []
+        for i in index:
+            if i == -1:
+                if current:
+                    faces.append(current)
+                    current = []
+            else:
+                current.append(i)
+        if current:
+            faces.append(current)
+
+        return faces
+
+    @staticmethod
+    def get_texture(name):
+        """Lê a textura (uma única vez) e gera todos os níveis do mipmap."""
+        if name not in GL.texture_cache:
+            image = np.asarray(gpu.GPU.load_texture(name))
+
+            # Garante 3 canais (RGB): tons de cinza são repetidos e o canal alfa é descartado
+            if image.ndim == 2:
+                image = image[:, :, None]
+            if image.shape[2] < 3:
+                image = np.repeat(image[:, :, :1], 3, axis=2)
+            image = image[:, :, :3].astype(np.float32)
+
+            # load_texture devolve a imagem transposta (índices [x][y]). Inverte o y para que
+            # v = 0 fique embaixo, como no X3D
+            levels = [np.ascontiguousarray(np.flip(image, axis=1))]
+
+            # Cada nível seguinte tem metade do tamanho: a média de blocos de 2x2 texels
+            while min(levels[-1].shape[:2]) >= 2:
+                prev = levels[-1]
+                w2, h2 = prev.shape[0] // 2, prev.shape[1] // 2
+                levels.append(prev[:2 * w2, :2 * h2].reshape(w2, 2, h2, 2, 3).mean(axis=(1, 3)))
+
+            GL.texture_cache[name] = levels
+
+        return GL.texture_cache[name]
+
+    @staticmethod
+    def bound_texture():
+        """Mipmap da textura da forma que está sendo desenhada (None se não tiver textura)."""
+        try:
+            import x3d
+            name = x3d.X3D.current_texture
+        except (ImportError, AttributeError):
+            return None
+
+        return GL.get_texture(name[0]) if name else None
+
+    @staticmethod
+    def sample_texture(image, u, v):
+        """Amostra a imagem com filtro bilinear, com a textura se repetindo (repeatS/T = TRUE)."""
+        w, h = image.shape[:2]
+
+        # Centro do texel i fica em (i + 0.5) / tamanho
+        x = np.nan_to_num(u * w - 0.5)
+        y = np.nan_to_num(v * h - 0.5)
+        x0 = np.floor(x)
+        y0 = np.floor(y)
+        fx = (x - x0)[:, None]
+        fy = (y - y0)[:, None]
+
+        x0 = x0.astype(np.int64)
+        y0 = y0.astype(np.int64)
+        xa, xb = x0 % w, (x0 + 1) % w
+        ya, yb = y0 % h, (y0 + 1) % h
+
+        top = image[xa, ya] * (1 - fx) + image[xb, ya] * fx
+        bottom = image[xa, yb] * (1 - fx) + image[xb, yb] * fx
+
+        return top * (1 - fy) + bottom * fy
+
+    @staticmethod
+    def sample_levels(levels, level, u, v):
+        """Amostra cada coordenada (u, v) no nível do mipmap indicado em level."""
+        colors = np.empty((len(u), 3))
+        for lv in np.unique(level):
+            mask = level == lv
+            colors[mask] = GL.sample_texture(levels[lv], u[mask], v[mask])
+
+        return colors
+
+    @staticmethod
+    def texture_color(levels, uv, uv_dx, uv_dy):
+        """Cor (0 a 255) da textura em cada pixel, escolhendo o nível do mipmap pelo tamanho do pixel.
+
+        uv, uv_dx e uv_dy são as coordenadas de textura do pixel e dos pixels vizinhos em x e y.
+        """
+        w0, h0 = levels[0].shape[:2]
+
+        # Derivadas de (u, v) em relação à tela, em texels por pixel
+        dudx = (uv_dx[:, 0] - uv[:, 0]) * w0
+        dvdx = (uv_dx[:, 1] - uv[:, 1]) * h0
+        dudy = (uv_dy[:, 0] - uv[:, 0]) * w0
+        dvdy = (uv_dy[:, 1] - uv[:, 1]) * h0
+
+        # L = quantos texels cabem em um pixel e D = log2(L) é o nível do mipmap
+        L = np.maximum(np.hypot(dudx, dvdx), np.hypot(dudy, dvdy))
+        with np.errstate(divide="ignore", invalid="ignore"):
+            D = np.log2(L)
+        last = len(levels) - 1
+        D = np.clip(np.nan_to_num(D, nan=0.0, neginf=0.0, posinf=last), 0, last)
+
+        # Interpola entre os dois níveis vizinhos de D (filtro trilinear) para não ter saltos
+        lower = np.floor(D).astype(int)
+        upper = np.minimum(lower + 1, last)
+        frac = (D - lower)[:, None]
+
+        return (GL.sample_levels(levels, lower, uv[:, 0], uv[:, 1]) * (1 - frac) +
+                GL.sample_levels(levels, upper, uv[:, 0], uv[:, 1]) * frac)
+
+    @staticmethod
+    def illuminate(normal, position, diffuse, emissive, specular, shininess, ambient, lights):
+        """Equação de iluminação do X3D (simplificada) calculada para cada pixel.
+
+        Irgb = emissive + SUM( luz.cor * (ambient + diffuse + specular) ), com
+        ambient  = luz.ambientIntensity * diffuse * material.ambientIntensity
+        diffuse  = luz.intensity * diffuse * sat(N . L)
+        specular = luz.intensity * specularColor * sat(N . ((L + v) / |L + v|)) ^ (shininess * 128)
+
+        normal e position são os vetores (n, 3) das normais e das posições no mundo, diffuse é a
+        cor (3,) ou (n, 3) do material. Retorna as cores (n, 3) entre 0 e 255.
+        """
+        N = GL.normalize(normal)
+        V = GL.normalize(GL.eye_position - position)  # do ponto até o observador
+
+        color = np.tile(np.asarray(emissive, dtype=float), (len(N), 1))
+        exponent = shininess * 128
+
+        for light in lights:
+            L = light["L"]  # do ponto até a luz
+            n_dot_l = N @ L
+
+            ambient_term = light["ambient"] * ambient * diffuse
+            diffuse_term = light["intensity"] * diffuse * np.clip(n_dot_l, 0, 1)[:, None]
+
+            # Só tem brilho especular se a luz estiver do lado certo da superfície
+            half = GL.normalize(V + L)
+            n_dot_h = np.clip(np.sum(N * half, axis=1), 0, 1)
+            specular_term = light["intensity"] * specular * (n_dot_h ** exponent * (n_dot_l > 0))[:, None]
+
+            color += light["color"] * (ambient_term + diffuse_term + specular_term)
+
+        return np.clip(color, 0, 1) * 255
+
+    @staticmethod
+    def interpolate(attrs, bary, inv_w):
+        """Interpola os atributos dos vértices (3, k) com correção de perspectiva.
+
+        bary são as coordenadas baricêntricas (três vetores de tamanho n) na tela e inv_w os
+        valores 1/Z de cada vértice. Cada atributo é dividido por Z, interpolado na tela e
+        depois multiplicado pelo Z do ponto: V = Z * (a * V0/Z0 + b * V1/Z1 + c * V2/Z2),
+        com 1/Z = a/Z0 + b/Z1 + c/Z2
+        """
+        weights = np.stack([bary[0] * inv_w[0], bary[1] * inv_w[1], bary[2] * inv_w[2]], axis=1)
+        inv_z = np.maximum(weights.sum(axis=1), 1e-12)
+
+        return (weights @ attrs) / inv_z[:, None]
+
+    @staticmethod
+    def rasterize(scr, w, attrs, shade, alpha=0.0, depth_test=True, derivs=False):
+        """Rasteriza um triângulo já projetado nos buffers de supersampling.
+
+        scr   : (3, 2) coordenadas de tela dos vértices
+        w     : (3,) distância de cada vértice até a câmera (sempre maior que zero)
+        attrs : (3, k) atributos dos vértices, interpolados com correção de perspectiva (ou None)
+        shade : função(n, attr, attr_dx, attr_dy) que devolve a cor (0 a 255) de cada um dos n
+                pixels (matriz (n, 3), ou só uma cor (3,) se for igual para todos). attr são os
+                atributos interpolados no pixel e attr_dx, attr_dy os dos pixels vizinhos em x e
+                y (só calculados se derivs for True, usados pelo mipmap)
+        alpha : transparência do material (0 opaco, 1 invisível)
+        depth_test : se False, o triângulo cobre o que já foi desenhado (usado no 2D)
+
+        A cobertura e a profundidade são calculadas em cada um dos 4 samples do pixel, enquanto
+        a cor (textura, iluminação) é calculada uma única vez por pixel, no centroide dos
+        samples cobertos, e depois copiada para os samples visíveis.
+        """
+        x0, y0 = scr[0]
+        x1, y1 = scr[1]
+        x2, y2 = scr[2]
+
+        # O dobro da área com sinal: triângulos degenerados ou fora do mundo não são desenhados
+        area = (x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0)
+        if not (math.isfinite(area) and abs(area) > 1e-12):
+            return
+        inv_area = 1.0 / area
+
+        # Bounding box do triângulo, limitada à área do framebuffer
+        x_lo = max(math.floor(min(x0, x1, x2)), 0)
+        x_hi = min(math.floor(max(x0, x1, x2)), GL.width - 1)
+        y_lo = max(math.floor(min(y0, y1, y2)), 0)
+        y_hi = min(math.floor(max(y0, y1, y2)), GL.height - 1)
+        if x_lo > x_hi or y_lo > y_hi:
+            return
+
+        # Posição de cada sample dentro da bounding box: (linhas, colunas, 4)
+        sx = np.arange(x_lo, x_hi + 1)[None, :, None] + GL.offsets[:, 0]
+        sy = np.arange(y_lo, y_hi + 1)[:, None, None] + GL.offsets[:, 1]
+
+        # Coordenadas baricêntricas de cada sample (área do sub-triângulo / área total)
+        b0 = ((x1 - sx) * (y2 - sy) - (y1 - sy) * (x2 - sx)) * inv_area
+        b1 = ((x2 - sx) * (y0 - sy) - (y2 - sy) * (x0 - sx)) * inv_area
+        b2 = ((x0 - sx) * (y1 - sy) - (y0 - sy) * (x1 - sx)) * inv_area
+
+        # O sample está dentro do triângulo quando as três coordenadas não são negativas
+        covered = (b0 >= 0) & (b1 >= 0) & (b2 >= 0)
+        if not covered.any():
+            return
+
+        # Profundidade de cada sample (distância até a câmera), com correção de perspectiva
+        inv_w = (1.0 / w[0], 1.0 / w[1], 1.0 / w[2])
+        depth = dbuf = visible = None
+        with np.errstate(divide="ignore", invalid="ignore"):
+            depth = 1.0 / (b0 * inv_w[0] + b1 * inv_w[1] + b2 * inv_w[2])
+            dbuf = GL.depth_buffer[y_lo:y_hi + 1, x_lo:x_hi + 1]
+            if depth_test:
+                # A tolerância evita que duas faces do mesmo plano, que dividem uma aresta,
+                # desenhem o mesmo sample duas vezes (o que aparece como uma linha na transparência)
+                visible = covered & (depth < dbuf * (1.0 - 1e-9))
+            else:
+                visible = covered
+
+        # Pixels em que algum sample vai ser desenhado
+        pixels = visible.any(axis=2)
+        if not pixels.any():
+            return
+        rows, cols = np.nonzero(pixels)
+        n = len(rows)
+
+        # Coordenadas baricêntricas do centroide dos samples cobertos de cada pixel. O centroide
+        # está sempre dentro do triângulo e, com o pixel todo coberto, é o centro do pixel
+        cov = covered[rows, cols]
+        count = cov.sum(axis=1)
+        c0 = (b0[rows, cols] * cov).sum(axis=1) / count
+        c1 = (b1[rows, cols] * cov).sum(axis=1) / count
+        c2 = (b2[rows, cols] * cov).sum(axis=1) / count
+
+        attr = attr_dx = attr_dy = None
+        if attrs is not None:
+            attr = GL.interpolate(attrs, (c0, c1, c2), inv_w)
+            if derivs:
+                # Atributos nos pixels vizinhos (x + 1 e y + 1), pela variação das baricêntricas
+                gx = ((y1 - y2) * inv_area, (y2 - y0) * inv_area, (y0 - y1) * inv_area)
+                gy = ((x2 - x1) * inv_area, (x0 - x2) * inv_area, (x1 - x0) * inv_area)
+                attr_dx = GL.interpolate(attrs, (c0 + gx[0], c1 + gx[1], c2 + gx[2]), inv_w)
+                attr_dy = GL.interpolate(attrs, (c0 + gy[0], c1 + gy[1], c2 + gy[2]), inv_w)
+
+        color = np.asarray(shade(n, attr, attr_dx, attr_dy), dtype=float)
+        if color.ndim == 1:
+            color = np.broadcast_to(color, (n, 3))
+
+        # Grava a cor nos samples visíveis. Com transparência ela é misturada à cor que já
+        # estava no sample: cor = cor_anterior * transparência + cor_nova * (1 - transparência)
+        color_buffer = GL.color_buffer[y_lo:y_hi + 1, x_lo:x_hi + 1]
+        previous = color_buffer[rows, cols]
+        new = color[:, None, :]
+        if alpha > 0:
+            new = previous * alpha + new * (1.0 - alpha)
+        color_buffer[rows, cols] = np.where(visible[rows, cols][:, :, None], new, previous)
+
+        if depth_test:
+            dbuf[visible] = depth[visible]
+        GL.touched[y_lo:y_hi + 1, x_lo:x_hi + 1] |= pixels
+
+    @staticmethod
+    def triangleSet(point, colors, vertexColor=None, textureCoords=None, normals=None,
+                    texture=None, cull=False):
         """Função usada para renderizar TriangleSet."""
         # https://www.web3d.org/specifications/X3Dv4/ISO-IEC19775-1v4-IS/Part01/components/rendering.html#TriangleSet
         # Nessa função você receberá pontos no parâmetro point, esses pontos são uma lista
@@ -349,129 +651,118 @@ class GL:
         # (emissiveColor), conforme implementar novos materias você deverá suportar outros
         # tipos de cores.
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("TriangleSet : pontos = {0}".format(point)) # imprime no terminal pontos
-        print("TriangleSet : colors = {0}".format(colors)) # imprime no terminal as cores
+        # Os outros parâmetros são usados pelas geometrias que desenham seus triângulos aqui:
+        # vertexColor   : cor (r, g, b) de cada vértice, na mesma ordem de point
+        # textureCoords : coordenadas (u, v) de cada vértice, na mesma ordem de point
+        # normals       : normal (x, y, z) de cada vértice, no espaço do objeto. Se for None cada
+        #                 triângulo usa a normal da sua face (flat shading)
+        # texture       : níveis do mipmap da textura (GL.get_texture)
+        # cull          : descarta as faces de trás (só para sólidos fechados, como Box e Sphere)
 
-        color = colors["emissiveColor"]
-        color = np.array(color) * 255
+        pts = np.asarray(point, dtype=float).reshape(-1, 3)
+        pts = pts[:3 * (len(pts) // 3)]
+        if len(pts) == 0:
+            return
 
-        txt = GL.texture_buffer
+        emissive = np.asarray(colors["emissiveColor"], dtype=float)
+        diffuse = np.asarray(colors["diffuseColor"], dtype=float)
+        specular = np.asarray(colors["specularColor"], dtype=float)
+        shininess = float(colors["shininess"])
+        ambient = float(colors["ambientIntensity"])
+        alpha = min(max(float(colors["transparency"]), 0.0), 1.0)
+        if alpha >= 1.0:
+            return  # totalmente transparente
 
-        pointsCoords = list(zip((point[::3]), point[1::3], point[2::3]))
-        trianglesCoords = list(zip((pointsCoords[::3]), pointsCoords[1::3], pointsCoords[2::3]))
+        # Sem nó Material o X3D não usa iluminação, a cor vem só dos vértices ou da textura.
+        # Como o get_colors devolve os valores padrão nesse caso, um material 100% padrão é
+        # tratado como se não existisse
+        lit = not (np.allclose(diffuse, 0.8) and not emissive.any() and not specular.any()
+                   and abs(shininess - 0.2) < 1e-9 and alpha == 0 and abs(ambient - 0.2) < 1e-9)
 
-        if vertexColor != None:
-            pointsColors = list(zip((vertexColor[::3]), vertexColor[1::3], vertexColor[2::3]))
-            trianglesColors = list(zip((pointsColors[::3]), pointsColors[1::3], pointsColors[2::3]))
+        vcolors = None
+        if vertexColor is not None and len(vertexColor) >= 3 * len(pts):
+            vcolors = np.asarray(vertexColor, dtype=float).reshape(-1, 3)[:len(pts)]
 
-        if textureCoords != None:
-            texturePoints = list(zip((textureCoords[::2]), textureCoords[1::2]))
-            trianglesTexture = list(zip((texturePoints[::3]), texturePoints[1::3], texturePoints[2::3]))
-        
+        uvs = None
+        if texture is not None and textureCoords is not None and len(textureCoords) >= 2 * len(pts):
+            uvs = np.asarray(textureCoords, dtype=float).reshape(-1, 2)[:len(pts)]
 
-        def semiplane(a, b, p):
-            return (p[0]-a[0])*(b[1]-a[1]) - (p[1]-a[1])*(b[0]-a[0])
+        # Todos os vértices: objeto -> mundo e depois mundo -> tela (matriz do viewpoint)
+        T = GL.transform_stack[-1]
+        world = np.hstack([pts, np.ones((len(pts), 1))]) @ T.T
+        clip = world @ GL.viewpoint_val.T
+        w_all = clip[:, 3]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            screen = clip[:, :2] / w_all[:, None]
 
-        def inside(p0, p1, p2, pixel):
-            a, b, c = semiplane(p0, p1, pixel), semiplane(p1, p2, pixel), semiplane(p2, p0, pixel)
-            return (a >= 0 and b >= 0 and c >= 0) or (a <= 0 and b <= 0 and c <= 0)
+        P3 = world[:, :3].reshape(-1, 3, 3)  # posição no mundo dos vértices de cada triângulo
+        S3 = screen.reshape(-1, 3, 2)
+        W3 = w_all.reshape(-1, 3)
 
-        def barycentric(triangle, target):
-            # Retorna True se o pixel estiver dentro do triangulo abc,
-            # caso contrário retorna False
+        # Não há recorte (clipping): triângulos com algum vértice atrás do plano near são descartados
+        valid = (W3 > GL.near).all(axis=1) & np.isfinite(S3).all(axis=(1, 2))
 
-            p0, p1, p2 = triangle
+        # Normal de cada face no mundo (aponta para fora quando os vértices estão no sentido
+        # anti-horário) e se a face está virada para a câmera. Uma escala negativa inverte
+        # o sentido dos vértices
+        if lit or cull:
+            det_sign = 1.0 if np.linalg.det(T[:3, :3]) >= 0 else -1.0
+            face_normal = np.cross(P3[:, 1] - P3[:, 0], P3[:, 2] - P3[:, 0]) * det_sign
+            length = np.linalg.norm(face_normal, axis=1)
+            facing = np.einsum("ij,ij->i", face_normal, GL.eye_position - P3[:, 0])
+            valid &= length > 1e-12
+            if cull:
+                valid &= facing > 0
 
-            # As normais entre as retas p0-p1 p1-p2 p2-p0
-            c = semiplane(p0,p1, target)
-            c, a, b = semiplane(p0, p1, target), semiplane(p1, p2, target), semiplane(p2, p0, target)
+        # Atributos de cada vértice que serão interpolados: [normal, posição] [cor] [u, v]
+        parts = []
+        if lit:
+            if normals is not None:
+                # As normais são transformadas pela inversa transposta da matriz do objeto
+                inverse = np.linalg.pinv(T[:3, :3])
+                vertex_normal = GL.normalize(np.asarray(normals, dtype=float).reshape(-1, 3)[:len(pts)] @ inverse)
+                vertex_normal = vertex_normal.reshape(-1, 3, 3)
+            else:
+                unit = face_normal / np.maximum(length, 1e-12)[:, None]
+                vertex_normal = np.repeat(unit[:, None, :], 3, axis=1)
+            # Nas faces de trás a normal é invertida, para iluminar o lado que a câmera enxerga
+            vertex_normal = np.where((facing < 0)[:, None, None], -vertex_normal, vertex_normal)
+            parts += [vertex_normal, P3]
+            o_normal, o_position = 0, 3
+        if vcolors is not None:
+            o_color = sum(p.shape[2] for p in parts)
+            parts.append(vcolors.reshape(-1, 3, 3))
+        if uvs is not None:
+            o_uv = sum(p.shape[2] for p in parts)
+            parts.append(uvs.reshape(-1, 3, 2))
+        attributes = np.concatenate(parts, axis=2) if parts else None
 
-            # Retorna [-1, -1, -1] se o target estiver fora do triangulo
-            if not (a >= 0 and b >= 0 and c >= 0) and \
-                    not (a <= 0 and b <= 0 and c <= 0):
-                
-                return None
+        # Luzes que iluminam a cena, o headlight sempre aponta para onde a câmera olha
+        lights = list(GL.lights)
+        if GL.headlight:
+            lights.append({"color": np.ones(3), "intensity": 1.0, "ambient": 0.0,
+                           "L": GL.eye_rotation[:, 2]})
 
-            # Normalizando 𝛼,𝛽,𝛾
-            a_, b_, c_ = [np.abs(x)/np.abs(a+b+c) for x in (a,b,c)]
+        def shade(n, attr, attr_dx, attr_dy):
+            # Cor base do pixel (a difusa do material, ou a de vértice, ou a da textura)
+            base = None
+            if uvs is not None:
+                base = GL.texture_color(texture, attr[:, o_uv:o_uv + 2], attr_dx[:, o_uv:o_uv + 2],
+                                        attr_dy[:, o_uv:o_uv + 2]) / 255.0
+            elif vcolors is not None:
+                base = attr[:, o_color:o_color + 3]
 
-            return a_, b_, c_ 
+            if not lit:
+                return np.clip(np.ones(3) if base is None else base, 0, 1) * 255
 
+            if base is None:
+                base = diffuse
+            return GL.illuminate(attr[:, o_normal:o_normal + 3], attr[:, o_position:o_position + 3],
+                                 base, emissive, specular, shininess, ambient, lights)
 
-        def interpolate_values(triangle, values, target, z_):
-
-            bc = barycentric(triangle, target)
-
-            z0, z1, z2 = z_
-            a_, b_, c_ = bc
-
-            cameraZ = 1 / ((a_ * (1/z0)) + (b_ * (1/z1)) + (c_ * (1/z2)))
-
-            clr = np.array([values[i] * bc[i] / z_[i] for i in range(len(values))]).T
-            
-            return clr.sum(1) * cameraZ
-
-        
-        for i in range(len(trianglesCoords)):
-
-            triangle = trianglesCoords[i]
-            triangle = np.transpose(np.array(triangle))
-
-            homogenous_triangle = np.eye(4)
-            homogenous_triangle[:3,:3] = triangle
-            homogenous_triangle[3] = [1] * len(homogenous_triangle[3])
-
-            T = GL.transform_stack[-1]
-            vp = GL.viewpoint_val
-
-            t_triangle = T @ homogenous_triangle
-            vp_triangle = vp @ t_triangle
-
-            f_triangle = GL.homogenous_div(vp_triangle)
-
-            t_ = np.transpose(f_triangle[:2,:3])
-            z_ = np.transpose(vp_triangle[3,:3])
-
-            x_min = math.floor(min(t_[:,0]))
-            x_max = math.floor(max(t_[:,0]))
-
-            y_min = math.floor(min(t_[:,1]))
-            y_max = math.floor(max(t_[:,1]))
-
-            if vertexColor != None:
-                triangleColors = np.asarray(trianglesColors[i])
-
-            if textureCoords != None:
-                triangleTexture = np.asarray(trianglesTexture[i])
-
-
-            for y in range(y_min, y_max+1):
-                for x in range(x_min, x_max + 1):
-
-                    target = (x + 0.5, y + 0.5)
-                    bc = barycentric(t_, (target))
-
-                    if bc != None:
-                        if vertexColor != None:
-                            interpolated = interpolate_values(t_, triangleColors, target, z_) * 255
-                            GL.draw([x,y], [math.floor(x) for x in interpolated])
-
-                        if textureCoords != None:
-                    
-                            interpolated = interpolate_values(t_, triangleTexture, target, z_)
-                            interpolated = interpolated @ np.diag(GL.texture_buffer.shape[:2])
-
-                            interpolated[1] = GL.texture_buffer.shape[1] - interpolated[1]
-
-                            value = GL.texture_buffer[*[math.floor(x) for x in interpolated]]
-
-                            GL.draw([x,y], value[:3])
-
-                        else:
-                            GL.draw([x,y], color)
-                    
-            
+        for t in np.nonzero(valid)[0]:
+            GL.rasterize(S3[t], W3[t], None if attributes is None else attributes[t], shade,
+                         alpha, derivs=uvs is not None)
 
     @staticmethod
     def viewpoint(position, orientation, fieldOfView):
@@ -479,12 +770,6 @@ class GL:
         # Na função de viewpoint você receberá a posição, orientação e campo de visão da
         # câmera virtual. Use esses dados para poder calcular e criar a matriz de projeção
         # perspectiva para poder aplicar nos pontos dos objetos geométricos.
-
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("Viewpoint : ", end='')
-        print("position = {0} ".format(position), end='')
-        print("orientation = {0} ".format(orientation), end='')
-        print("fieldOfView = {0} ".format(fieldOfView))
 
         # Coordenadas da câmera
         lkat = GL.lookAt(position, orientation[:3], orientation[3])
@@ -501,7 +786,9 @@ class GL:
         # Matriz de viewpoint sem divisão homogênea
         GL.viewpoint_val = vp
 
-        
+        # Onde a câmera está e para onde ela aponta, usados no cálculo da iluminação
+        GL.eye_position = np.array(position, dtype=float)
+        GL.eye_rotation = GL.quat_rotation(orientation[:3], orientation[3])[:3, :3]
 
     @staticmethod
     def transform_in(translation, scale, rotation):
@@ -513,17 +800,18 @@ class GL:
         # do objeto ao redor do eixo x, y, z por t radianos, seguindo a regra da mão direita.
         # ESSES NÃO SÃO OS VALORES DE QUATÉRNIOS AS CONTAS AINDA PRECISAM SER FEITAS.
         # Quando se entrar em um nó transform se deverá salvar a matriz de transformação dos
-        # modelos do mundo para depois potencialmente usar em outras chamadas. 
+        # modelos do mundo para depois potencialmente usar em outras chamadas.
         # Quando começar a usar Transforms dentre de outros Transforms, mais a frente no curso
         # Você precisará usar alguma estrutura de dados pilha para organizar as matrizes.
 
+        # Os valores podem vir de uma animação (ROUTE), então não dá para testá-los com "if valor"
         T = np.eye(4)
 
-        if scale:
+        if scale is not None and len(scale) == 3:
             T = GL.scaling(scale) @ T
-        if rotation:
+        if rotation is not None and len(rotation) == 4:
             T = GL.quat_rotation(rotation[:3], rotation[3]) @ T
-        if translation:
+        if translation is not None and len(translation) == 3:
             T = GL.translate(translation) @ T
 
         GL.transform_stack.append( GL.transform_stack[-1] @ T)
@@ -536,9 +824,33 @@ class GL:
         # deverá recuperar a matriz de transformação dos modelos do mundo da estrutura de
         # pilha implementada.
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-
         GL.transform_stack.pop(-1)
+
+    @staticmethod
+    def draw_strips(point, strips, colors):
+        """Desenha tiras de triângulos, dadas como listas com os índices dos vértices."""
+        pts = np.asarray(point, dtype=float).reshape(-1, 3)
+
+        # Cada tira vira os triângulos (i, i+1, i+2). Nos de índice ímpar os dois primeiros
+        # vértices são trocados para que todos fiquem no mesmo sentido (anti-horário)
+        triangles = []
+        for strip in strips:
+            for i in range(len(strip) - 2):
+                a, b, c = strip[i], strip[i + 1], strip[i + 2]
+                triangles.append((b, a, c) if i % 2 else (a, b, c))
+        if not triangles:
+            return
+        tri = np.array(triangles)
+
+        # Normal de cada vértice: média das normais das faces que compartilham o vértice
+        face_normal = GL.normalize(np.cross(pts[tri[:, 1]] - pts[tri[:, 0]],
+                                            pts[tri[:, 2]] - pts[tri[:, 0]]))
+        vertex_normal = np.zeros_like(pts)
+        for corner in range(3):
+            np.add.at(vertex_normal, tri[:, corner], face_normal)
+        vertex_normal = GL.normalize(vertex_normal)
+
+        GL.triangleSet(pts[tri].reshape(-1), colors, normals=vertex_normal[tri].reshape(-1))
 
     @staticmethod
     def triangleStripSet(point, stripCount, colors):
@@ -555,27 +867,13 @@ class GL:
         # depois 2, 3 e 4, e assim por diante. Cuidado com a orientação dos vértices, ou seja,
         # todos no sentido horário ou todos no sentido anti-horário, conforme especificado.
 
-        points = list(zip((point[::3]), point[1::3], point[2::3]))
+        # Cada tira usa stripCount[i] vértices seguidos, começando onde a anterior terminou
+        strips, start = [], 0
+        for count in stripCount:
+            strips.append(list(range(start, start + count)))
+            start += count
 
-        strips = []
-
-        for i, n in enumerate(stripCount):
-            strips.append([points[j+stripCount[i-1]] if i>0 else points[j] for j in range(n)])
-
-        for strip in strips:
-            triangles = list(zip(points, points[1:], points[2:]))
-            triangles = [(t[2], t[1], t[0]) if i // 2 == 1 else t for i, t in enumerate(triangles) ]
-
-            t_set = np.array(triangles).flatten().tolist()
-            
-            GL.triangleSet(t_set, colors)
-
-            # print("Triangles ------------------------")
-            # for i, triangle in enumerate(triangles):
-            #     print(f"{triangle} -- {i}")
-        
-                
-        
+        GL.draw_strips(point, strips, colors)
 
     @staticmethod
     def indexedTriangleStripSet(point, index, colors):
@@ -593,29 +891,7 @@ class GL:
         # depois 2, 3 e 4, e assim por diante. Cuidado com a orientação dos vértices, ou seja,
         # todos no sentido horário ou todos no sentido anti-horário, conforme especificado.
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("IndexedTriangleStripSet : pontos = {0}, index = {1}".format(point, index))
-        print("IndexedTriangleStripSet : colors = {0}".format(colors)) # imprime as cores
-
-        points = list(zip((point[::3]), point[1::3], point[2::3]))
-
-        strips = []
-        current_strip = []
-
-        for id in index:
-
-            if id == -1:
-                strips.append(current_strip)
-                current_strip = []
-            else:
-                current_strip.append(id)
-
-
-        for strip in strips:
-            values = np.array([points[i] for i in strip]).flatten().tolist()
-
-            GL.triangleStripSet(values, [len(strip)], colors)
-
+        GL.draw_strips(point, GL.split_faces(index), colors)
 
     @staticmethod
     def indexedFaceSet(coord, coordIndex, colorPerVertex, color, colorIndex,
@@ -639,7 +915,7 @@ class GL:
         # os vértices 0, 2 e 3, e depois 0, 3 e 4, e assim por diante, até chegar no final da lista.
 
 
-        # Parte 2   
+        # Parte 2
 
 
         # Adicionalmente essa implementação do IndexedFace aceita cores por vértices, assim
@@ -650,78 +926,60 @@ class GL:
         # cor da textura conforme a posição do mapeamento. Dentro da classe GPU já está
         # implementadado um método para a leitura de imagens.
 
-        # Os prints abaixo são só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("IndexedFaceSet : ")
-        if coord:
-            print("\tpontos(x, y, z) = {0}, coordIndex = {1}".format(coord, coordIndex))
-        print("colorPerVertex = {0}".format(colorPerVertex))
-        if colorPerVertex and color and colorIndex:
-            print("\tcores(r, g, b) = {0}, colorIndex = {1}".format(color, colorIndex))
-        if texCoord and texCoordIndex:
-            print("\tpontos(u, v) = {0}, texCoordIndex = {1}".format(texCoord, texCoordIndex))
-        if current_texture:
-            image = gpu.GPU.load_texture(current_texture[0])
-            print("\t Matriz com image = {0}".format(image))
-            print("\t Dimensões da image = {0}".format(image.shape))
-        print("IndexedFaceSet : colors = {0}".format(colors))  # imprime no terminal as cores
+        if not coord or not coordIndex:
+            return
 
-        # Exemplo de desenho de um pixel branco na coordenada 10, 10
-        gpu.GPU.draw_pixel([10, 10], gpu.GPU.RGB8, [255, 255, 255])  # altera pixel
+        points = np.asarray(coord, dtype=float).reshape(-1, 3)
+        faces = GL.split_faces(coordIndex)
 
-        points = np.array(list(zip((coord[::3]), coord[1::3], coord[2::3])))
+        # Cores: por vértice de cada face (colorIndex, ou coordIndex se não houver) ou uma por face
+        palette = np.asarray(color, dtype=float).reshape(-1, 3) if color else None
+        color_faces, face_colors = faces, None
+        if palette is not None:
+            if colorPerVertex and colorIndex:
+                color_faces = GL.split_faces(colorIndex)
+            elif not colorPerVertex:
+                face_colors = [c for c in colorIndex if c >= 0] if colorIndex else list(range(len(faces)))
 
-        ci = np.array(coordIndex)
-        sep = np.where(ci == -1)[0]
+        # Textura: só é usada se a forma tem textura e coordenadas de textura
+        texture, uv_table, uv_faces = None, None, faces
+        if current_texture and texCoord:
+            texture = GL.get_texture(current_texture[0])
+            uv_table = np.asarray(texCoord, dtype=float).reshape(-1, 2)
+            if texCoordIndex:
+                uv_faces = GL.split_faces(texCoordIndex)
 
-        facesCoords = np.split(points[np.delete(ci,sep)], sep - np.arange(len(sep)))[:-1]
+        # Cada face vira um leque de triângulos: (0, 1, 2), (0, 2, 3), (0, 3, 4), ...
+        point_index, color_index, uv_index = [], [], []
+        for f, face in enumerate(faces):
+            if len(face) < 3:
+                continue
 
-        if colorPerVertex:
-            vertexColors = np.array(list(zip((color[::3]), color[1::3], color[2::3])))
-            facesColors = np.split(vertexColors[np.delete(ci,sep)], sep - np.arange(len(sep)))[:-1]
+            vertex_colors = color_faces[f] if f < len(color_faces) else face
+            if len(vertex_colors) != len(face):
+                vertex_colors = face
+            vertex_uvs = uv_faces[f] if f < len(uv_faces) else face
+            if len(vertex_uvs) != len(face):
+                vertex_uvs = face
 
-        if current_texture:
-            textureCoord = np.array(list(zip((texCoord[::2]), texCoord[1::2])))
-            facesTexture = np.split(textureCoord[np.delete(ci,sep)], sep - np.arange(len(sep)))[:-1]
+            for k in range(1, len(face) - 1):
+                for corner in (0, k, k + 1):
+                    point_index.append(face[corner])
+                    if palette is not None:
+                        if face_colors is not None:
+                            color_index.append(face_colors[min(f, len(face_colors) - 1)])
+                        else:
+                            color_index.append(vertex_colors[corner])
+                    if uv_table is not None:
+                        uv_index.append(vertex_uvs[corner])
 
-        for i in range(len(facesCoords)):
+        if not point_index:
+            return
 
-            faceCoords = facesCoords[i]
-
-            trianglesCoords = list(zip([faceCoords[0]]*len(faceCoords), faceCoords[1:], faceCoords[2:]))
-            trianglesCoords += [(faceCoords[0], faceCoords[-2], faceCoords[-1])]
-
-            t_setCoords = np.array(trianglesCoords).flatten().tolist()
-
-            if colorPerVertex:
-                faceColors = facesColors[i]
-
-                trianglesColors = list(zip([faceColors[0]]*len(faceColors), faceColors[1:], faceColors[2:]))
-                trianglesColors += [(faceColors[0], faceColors[-2], faceColors[-1])]
-
-                t_setColors = np.array(trianglesColors).flatten().tolist()
-            else:
-                t_setColors = None
-
-            if current_texture:
-                faceTexture = facesTexture[i]
-                GL.texture_buffer = gpu.GPU.load_texture(current_texture[0])
-
-                trianglesTexture = list(zip([faceTexture[0]]*len(faceTexture), faceTexture[1:], faceTexture[2:]))
-                trianglesTexture += [(faceTexture[0], faceTexture[-2], faceTexture[-1])]
-
-                t_setTexture = np.array(trianglesTexture).flatten().tolist()
-            else:
-                t_setTexture = None
-            # triangles = [(t[2], t[1], t[0]) if i // 2 == 1 else t for i, t in enumerate(triangles) ]
-
-            
-            GL.triangleSet(t_setCoords, colors, t_setColors, t_setTexture)
-
-            # print("Triangles ------------------------")
-            # for i, triangle in enumerate(triangles):
-            #     print(f"{triangle} -- {i}")
-
-
+        GL.triangleSet(points[point_index].reshape(-1), colors,
+                       palette[color_index].reshape(-1) if palette is not None else None,
+                       uv_table[uv_index].reshape(-1) if uv_table is not None else None,
+                       texture=texture)
 
     @staticmethod
     def box(size, colors):
@@ -734,12 +992,31 @@ class GL:
         # essa caixa você vai provavelmente querer tesselar ela em triângulos, para isso
         # encontre os vértices e defina os triângulos.
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("Box : size = {0}".format(size)) # imprime no terminal pontos
-        print("Box : colors = {0}".format(colors)) # imprime no terminal as cores
+        hx, hy, hz = size[0] / 2, size[1] / 2, size[2] / 2
 
-        # Exemplo de desenho de um pixel branco na coordenada 10, 10
-        gpu.GPU.draw_pixel([10, 10], gpu.GPU.RGB8, [255, 255, 255])  # altera pixel
+        # Cada face tem 4 vértices no sentido anti-horário visto de fora, começando pelo canto
+        # inferior esquerdo (é nesse canto que a textura começa)
+        faces = [
+            [(-hx, -hy, hz), (hx, -hy, hz), (hx, hy, hz), (-hx, hy, hz)],       # frente (+z)
+            [(hx, -hy, -hz), (-hx, -hy, -hz), (-hx, hy, -hz), (hx, hy, -hz)],   # trás (-z)
+            [(hx, -hy, hz), (hx, -hy, -hz), (hx, hy, -hz), (hx, hy, hz)],       # direita (+x)
+            [(-hx, -hy, -hz), (-hx, -hy, hz), (-hx, hy, hz), (-hx, hy, -hz)],   # esquerda (-x)
+            [(-hx, hy, hz), (hx, hy, hz), (hx, hy, -hz), (-hx, hy, -hz)],       # topo (+y)
+            [(-hx, -hy, -hz), (hx, -hy, -hz), (hx, -hy, hz), (-hx, -hy, hz)],   # base (-y)
+        ]
+        corner_uv = [(0, 0), (1, 0), (1, 1), (0, 1)]
+
+        coords, uvs = [], []
+        for quad in faces:
+            for a, b, c in ((0, 1, 2), (0, 2, 3)):
+                coords += [quad[a], quad[b], quad[c]]
+                uvs += [corner_uv[a], corner_uv[b], corner_uv[c]]
+
+        # Se a caixa tem textura, cada face recebe a imagem inteira
+        texture = GL.bound_texture()
+        GL.triangleSet(np.array(coords).reshape(-1), colors,
+                       textureCoords=np.array(uvs).reshape(-1) if texture is not None else None,
+                       texture=texture, cull=True)
 
     @staticmethod
     def sphere(radius, colors):
@@ -751,9 +1028,24 @@ class GL:
         # precisar tesselar ela em triângulos, para isso encontre os vértices e defina
         # os triângulos.
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("Sphere : radius = {0}".format(radius)) # imprime no terminal o raio da esfera
-        print("Sphere : colors = {0}".format(colors)) # imprime no terminal as cores
+        stacks, slices = 16, 32
+
+        # Grade de pontos da esfera: theta vai do polo norte (+y) ao sul e phi dá a volta no eixo y
+        theta, phi = np.meshgrid(np.linspace(0, math.pi, stacks + 1),
+                                 np.linspace(0, 2 * math.pi, slices + 1), indexing="ij")
+        unit = np.stack([np.sin(theta) * np.cos(phi), np.cos(theta), np.sin(theta) * np.sin(phi)], axis=-1)
+        points = radius * unit
+
+        # Cada célula da grade (A, B, C, D) vira dois triângulos anti-horários vistos de fora:
+        # (A, D, C) e (A, C, B). A normal da esfera em cada ponto é o próprio vetor unitário
+        i, j = np.meshgrid(np.arange(stacks), np.arange(slices), indexing="ij")
+        i, j = i.ravel(), j.ravel()
+        corners = [((i, j), (i, j + 1), (i + 1, j + 1)), ((i, j), (i + 1, j + 1), (i + 1, j))]
+
+        coords = np.concatenate([np.stack([points[c] for c in tri], axis=1) for tri in corners])
+        normals = np.concatenate([np.stack([unit[c] for c in tri], axis=1) for tri in corners])
+
+        GL.triangleSet(coords.reshape(-1), colors, normals=normals.reshape(-1), cull=True)
 
     @staticmethod
     def cone(bottomRadius, height, colors):
@@ -766,10 +1058,34 @@ class GL:
         # Para desenha esse cone você vai precisar tesselar ele em triângulos, para isso
         # encontre os vértices e defina os triângulos.
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("Cone : bottomRadius = {0}".format(bottomRadius)) # imprime no terminal o raio da base do cone
-        print("Cone : height = {0}".format(height)) # imprime no terminal a altura do cone
-        print("Cone : colors = {0}".format(colors)) # imprime no terminal as cores
+        slices = 24
+        r, h = bottomRadius, height
+
+        phi = np.linspace(0, 2 * math.pi, slices + 1)
+        ring = np.stack([r * np.cos(phi), np.full_like(phi, -h / 2), r * np.sin(phi)], axis=1)
+        apex = np.array([0.0, h / 2, 0.0])
+        center = np.array([0.0, -h / 2, 0.0])
+        slant = math.hypot(r, h)
+
+        def side_normal(angle):
+            # Normal da lateral do cone, que aponta para fora e um pouco para cima
+            return np.array([h * math.cos(angle), r, h * math.sin(angle)]) / slant
+
+        down = np.array([0.0, -1.0, 0.0])
+        coords, normals = [], []
+        for k in range(slices):
+            middle = (phi[k] + phi[k + 1]) / 2
+
+            # Lateral: o ápice usa a normal do meio da fatia, pois ali ela muda em cada fatia
+            coords.append([apex, ring[k + 1], ring[k]])
+            normals.append([side_normal(middle), side_normal(phi[k + 1]), side_normal(phi[k])])
+
+            # Base
+            coords.append([center, ring[k], ring[k + 1]])
+            normals.append([down, down, down])
+
+        GL.triangleSet(np.array(coords).reshape(-1), colors,
+                       normals=np.array(normals).reshape(-1), cull=True)
 
     @staticmethod
     def cylinder(radius, height, colors):
@@ -782,10 +1098,33 @@ class GL:
         # Para desenha esse cilindro você vai precisar tesselar ele em triângulos, para isso
         # encontre os vértices e defina os triângulos.
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("Cylinder : radius = {0}".format(radius)) # imprime no terminal o raio do cilindro
-        print("Cylinder : height = {0}".format(height)) # imprime no terminal a altura do cilindro
-        print("Cylinder : colors = {0}".format(colors)) # imprime no terminal as cores
+        slices = 24
+        r, h = radius, height
+
+        phi = np.linspace(0, 2 * math.pi, slices + 1)
+        bottom = np.stack([r * np.cos(phi), np.full_like(phi, -h / 2), r * np.sin(phi)], axis=1)
+        top = np.stack([r * np.cos(phi), np.full_like(phi, h / 2), r * np.sin(phi)], axis=1)
+        side = np.stack([np.cos(phi), np.zeros_like(phi), np.sin(phi)], axis=1)  # normais da lateral
+        top_center = np.array([0.0, h / 2, 0.0])
+        bottom_center = np.array([0.0, -h / 2, 0.0])
+        up = np.array([0.0, 1.0, 0.0])
+
+        coords, normals = [], []
+        for k in range(slices):
+            # Lateral: dois triângulos por fatia
+            coords.append([bottom[k], top[k], top[k + 1]])
+            normals.append([side[k], side[k], side[k + 1]])
+            coords.append([bottom[k], top[k + 1], bottom[k + 1]])
+            normals.append([side[k], side[k + 1], side[k + 1]])
+
+            # Tampas
+            coords.append([top_center, top[k + 1], top[k]])
+            normals.append([up, up, up])
+            coords.append([bottom_center, bottom[k], bottom[k + 1]])
+            normals.append([-up, -up, -up])
+
+        GL.triangleSet(np.array(coords).reshape(-1), colors,
+                       normals=np.array(normals).reshape(-1), cull=True)
 
     @staticmethod
     def navigationInfo(headlight):
@@ -797,8 +1136,9 @@ class GL:
         # A luz headlight deve ser direcional, ter intensidade = 1, cor = (1 1 1),
         # ambientIntensity = 0,0 e direção = (0 0 −1).
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("NavigationInfo : headlight = {0}".format(headlight)) # imprime no terminal
+        # A direção (0 0 -1) é no espaço da câmera, então ela é calculada no triangleSet
+        # a partir da rotação do Viewpoint
+        GL.headlight = bool(headlight)
 
     @staticmethod
     def directionalLight(ambientIntensity, color, intensity, direction):
@@ -810,11 +1150,18 @@ class GL:
         # que emana da fonte de luz no sistema de coordenadas local. A luz é emitida ao
         # longo de raios paralelos de uma distância infinita.
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("DirectionalLight : ambientIntensity = {0}".format(ambientIntensity))
-        print("DirectionalLight : color = {0}".format(color)) # imprime no terminal
-        print("DirectionalLight : intensity = {0}".format(intensity)) # imprime no terminal
-        print("DirectionalLight : direction = {0}".format(direction)) # imprime no terminal
+        direction = np.asarray(direction, dtype=float)
+        length = np.linalg.norm(direction)
+        if length < 1e-12:
+            return
+
+        # L é o vetor que sai da superfície em direção à luz, ou seja, o oposto da direção da luz
+        GL.lights.append({
+            "ambient": float(ambientIntensity),
+            "color": np.asarray(color, dtype=float),
+            "intensity": float(intensity),
+            "L": -direction / length,
+        })
 
     @staticmethod
     def pointLight(ambientIntensity, color, intensity, location):
@@ -862,15 +1209,32 @@ class GL:
 
         # Deve retornar a fração de tempo passada em fraction_changed
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("TimeSensor : cycleInterval = {0}".format(cycleInterval)) # imprime no terminal
-        print("TimeSensor : loop = {0}".format(loop))
+        # O tempo conta a partir da primeira chamada, ou seja, a animação começa no primeiro frame
+        now = time.time()  # time in seconds since the epoch as a floating point number.
+        if GL.start_time is None:
+            GL.start_time = now
+        elapsed = now - GL.start_time
 
-        # Esse método já está implementado para os alunos como exemplo
-        epoch = time.time()  # time in seconds since the epoch as a floating point number.
-        fraction_changed = (epoch % cycleInterval) / cycleInterval
+        if cycleInterval <= 0:
+            return 0.0
+
+        if loop:
+            fraction_changed = (elapsed % cycleInterval) / cycleInterval
+        else:
+            fraction_changed = min(elapsed / cycleInterval, 1.0)  # termina no fim do ciclo
 
         return fraction_changed
+
+    @staticmethod
+    def find_interval(key, fraction):
+        """Índice i do intervalo da animação (key[i] <= fraction < key[i+1]) e a posição s (0 a 1) nele."""
+        i = int(np.searchsorted(key, fraction, side="right")) - 1
+        i = min(max(i, 0), len(key) - 2)
+
+        span = key[i + 1] - key[i]
+        s = (fraction - key[i]) / span if span > 0 else 0.0
+
+        return i, s
 
     @staticmethod
     def splinePositionInterpolator(set_fraction, key, keyValue, closed):
@@ -884,16 +1248,81 @@ class GL:
         # como fechada, com uma transições da última chave para a primeira chave. Se os keyValues
         # na primeira e na última chave não forem idênticos, o campo closed será ignorado.
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("SplinePositionInterpolator : set_fraction = {0}".format(set_fraction))
-        print("SplinePositionInterpolator : key = {0}".format(key)) # imprime no terminal
-        print("SplinePositionInterpolator : keyValue = {0}".format(keyValue))
-        print("SplinePositionInterpolator : closed = {0}".format(closed))
+        if not key or not keyValue:
+            return [0.0, 0.0, 0.0]
 
-        # Abaixo está só um exemplo de como os dados podem ser calculados e transferidos
-        value_changed = [0.0, 0.0, 0.0]
-        
+        values = np.asarray(keyValue, dtype=float).reshape(-1, 3)
+        keys = np.asarray(key, dtype=float)[:len(values)]
+        values = values[:len(keys)]
+        n = len(keys)
+
+        # Fora do intervalo das chaves vale o primeiro ou o último valor
+        if n == 1 or set_fraction <= keys[0]:
+            return values[0].tolist()
+        if set_fraction >= keys[-1]:
+            return values[-1].tolist()
+
+        i, s = GL.find_interval(keys, set_fraction)
+
+        # Tangentes de Catmull-Rom: T_i = (v_(i+1) - v_(i-1)) / 2. Nas pontas elas são nulas, a
+        # menos que a curva seja fechada (primeiro e último valor idênticos), quando as duas
+        # pontas usam a mesma tangente e a curva fica suave na emenda
+        is_loop = bool(closed) and n > 2 and np.allclose(values[0], values[-1])
+
+        def tangent(k):
+            if k == 0 or k == n - 1:
+                return (values[1] - values[n - 2]) / 2 if is_loop else np.zeros(3)
+            return (values[k + 1] - values[k - 1]) / 2
+
+        # Interpolação de Hermite: v = S^T H C, com S = [s^3, s^2, s, 1] e C = [v_i, v_(i+1), T_i, T_(i+1)]
+        S = np.array([s ** 3, s ** 2, s, 1.0])
+        H = np.array([[ 2, -2,  1,  1],
+                      [-3,  3, -2, -1],
+                      [ 0,  0,  1,  0],
+                      [ 1,  0,  0,  0]])
+        C = np.array([values[i], values[i + 1], tangent(i), tangent(i + 1)])
+
+        value_changed = (S @ H @ C).tolist()
+
         return value_changed
+
+    @staticmethod
+    def quaternion(rotation):
+        """Quatérnio unitário [x, y, z, w] de uma rotação [x, y, z, ângulo]."""
+        axis = GL.normalize(np.asarray(rotation[:3], dtype=float))
+        if not axis.any():
+            return np.array([0.0, 0.0, 0.0, 1.0])
+
+        return np.append(axis * math.sin(rotation[3] / 2), math.cos(rotation[3] / 2))
+
+    @staticmethod
+    def slerp(q0, q1, s):
+        """Interpolação esférica entre dois quatérnios unitários, pelo caminho mais curto."""
+        dot = float(np.dot(q0, q1))
+        if dot < 0:  # os dois sinais representam a mesma rotação, fica com o mais próximo
+            q1, dot = -q1, -dot
+
+        if dot > 0.9995:  # quase iguais: a interpolação linear já é suficiente
+            q = q0 + s * (q1 - q0)
+        else:
+            theta = math.acos(dot)
+            q = (math.sin((1 - s) * theta) * q0 + math.sin(s * theta) * q1) / math.sin(theta)
+
+        return q / np.linalg.norm(q)
+
+    @staticmethod
+    def axis_angle(q):
+        """Rotação [x, y, z, ângulo] de um quatérnio unitário [x, y, z, w]."""
+        if q[3] < 0:
+            q = -q
+        w = min(max(float(q[3]), -1.0), 1.0)
+
+        sin_half = math.sqrt(max(1 - w * w, 0.0))
+        if sin_half < 1e-9:
+            return [0.0, 0.0, 1.0, 0.0]
+
+        return [float(q[0] / sin_half), float(q[1] / sin_half), float(q[2] / sin_half),
+                2 * math.acos(w)]
 
     @staticmethod
     def orientationInterpolator(set_fraction, key, keyValue):
@@ -910,13 +1339,25 @@ class GL:
         # zeroa a um. O campo keyValue deve conter exatamente tantas rotações 3D quanto os
         # quadros-chave no key.
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("OrientationInterpolator : set_fraction = {0}".format(set_fraction))
-        print("OrientationInterpolator : key = {0}".format(key)) # imprime no terminal
-        print("OrientationInterpolator : keyValue = {0}".format(keyValue))
+        if not key or not keyValue:
+            return [0.0, 0.0, 1.0, 0.0]
 
-        # Abaixo está só um exemplo de como os dados podem ser calculados e transferidos
-        value_changed = [0, 0, 1, 0]
+        values = np.asarray(keyValue, dtype=float).reshape(-1, 4)
+        keys = np.asarray(key, dtype=float)[:len(values)]
+        values = values[:len(keys)]
+
+        # Fora do intervalo das chaves vale o primeiro ou o último valor
+        if len(keys) == 1 or set_fraction <= keys[0]:
+            return values[0].tolist()
+        if set_fraction >= keys[-1]:
+            return values[-1].tolist()
+
+        i, s = GL.find_interval(keys, set_fraction)
+
+        # SLERP: interpola os quatérnios das duas rotações e volta para eixo e ângulo
+        q = GL.slerp(GL.quaternion(values[i]), GL.quaternion(values[i + 1]), s)
+
+        value_changed = GL.axis_angle(q)
 
         return value_changed
 

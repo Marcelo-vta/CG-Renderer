@@ -10,6 +10,7 @@ Data: 28 de Agosto de 2020
 """
 
 import os           # Para rotinas do sistema operacional
+import time         # Para o relógio que a interface usa no cálculo do FPS
 import argparse     # Para tratar os parâmetros da linha de comando
 
 import gl           # Recupera rotinas de suporte ao X3D
@@ -22,6 +23,8 @@ import scenegraph   # Imprime o grafo de cena no console
 
 LARGURA = 60  # Valor padrão para largura da tela
 ALTURA = 40   # Valor padrão para altura da tela
+
+PASSO_RELOGIO = 1/64  # Passo (15,625 ms) com que o time.process_time() avança no Windows
 
 
 class Renderizador:
@@ -65,13 +68,13 @@ class Renderizador:
         )
 
         # Descomente as seguintes linhas se for usar um Framebuffer para profundidade
-        # gpu.GPU.framebuffer_storage(
-        #     self.framebuffers["FRONT"],
-        #     gpu.GPU.DEPTH_ATTACHMENT,
-        #     gpu.GPU.DEPTH_COMPONENT32F,
-        #     self.width,
-        #     self.height
-        # )
+        gpu.GPU.framebuffer_storage(
+            self.framebuffers["FRONT"],
+            gpu.GPU.DEPTH_ATTACHMENT,
+            gpu.GPU.DEPTH_COMPONENT32F,
+            self.width,
+            self.height
+        )
     
         # Opções:
         # - COLOR_ATTACHMENT: alocações para as cores da imagem renderizada
@@ -101,6 +104,11 @@ class Renderizador:
         # Limpa o frame buffers atual
         gpu.GPU.clear_buffer()
 
+        # Limpa os buffers de supersampling (profundidade e cor dos samples) e as luzes. Como
+        # o display é sequencial não há double buffer, mas isso precisa ser feito em todo frame
+        # para a animação não acumular o desenho do frame anterior
+        gl.GL.clear_buffers()
+
         # Recursos que podem ser úteis:
         # Define o valor do pixel no framebuffer: draw_pixel(coord, mode, data)
         # Retorna o valor do pixel no framebuffer: read_pixel(coord, mode)
@@ -112,6 +120,9 @@ class Renderizador:
         # Essa é uma chamada conveniente para manipulação de buffers
         # ao final da renderização de um frame. Como por exemplo, executar
         # downscaling da imagem.
+
+        # Renderiza o buffer de supersampling no framebuffer (uma vez por frame)
+        gl.GL.render_buffer()
 
         # Método para a troca dos buffers (NÃO IMPLEMENTADO)
         # Esse método será utilizado na fase de implementação de animações
@@ -143,11 +154,23 @@ class Renderizador:
         x3d.X3D.renderer["SplinePositionInterpolator"] = gl.GL.splinePositionInterpolator
         x3d.X3D.renderer["OrientationInterpolator"] = gl.GL.orientationInterpolator
 
+    def protege_fps(self):
+        """Evita que a interface divida por zero ao calcular o FPS."""
+        # A janela calcula o FPS como 1 / (time.process_time() - instante do frame anterior), só
+        # que no Windows o process_time() avança em passos de 15,625 ms. Um frame mais rápido que
+        # isso deixava a diferença igual a zero e a animação parava com ZeroDivisionError. Quando
+        # isso acontece, o instante do frame anterior é recuado um passo do relógio, o que só
+        # muda o FPS exibido.
+        agora = time.process_time()
+        if agora - getattr(interface.Interface, "last_time", 0.0) <= 0:
+            interface.Interface.last_time = agora - PASSO_RELOGIO
+
     def render(self):
         """Laço principal de renderização."""
         self.pre()  # executa rotina pré renderização
         self.scene.render()  # faz o traversal no grafo de cena
         self.pos()  # executa rotina pós renderização
+        self.protege_fps()  # garante que a janela não calcule o FPS dividindo por zero
         return gpu.GPU.get_frame_buffer()
 
     def main(self):
@@ -206,6 +229,7 @@ class Renderizador:
 
         # Se no modo silencioso salvar imagem e não mostrar janela de visualização
         if args.quiet:
+            self.render()  # Sem a janela ninguém chama o render, então renderiza um quadro aqui
             gpu.GPU.save_image()  # Salva imagem em arquivo
         else:
             window.set_saver(gpu.GPU.save_image)  # pasa a função para salvar imagens
